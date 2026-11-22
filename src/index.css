@@ -1,0 +1,152 @@
+@import "tailwindcss";
+@import "maplibre-gl/dist/maplibre-gl.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --atlas-bg-primary: #0b0d10;
+    --atlas-bg-inset: #0e1116;
+    --atlas-bg-secondary: #12151b;
+    --atlas-bg-raised: #151922;
+    --atlas-bg-elevated: #181c24;
+    --atlas-bg-hover: #1b2029;
+    --atlas-border-subtle: #1e242e;
+    --atlas-border: #252b36;
+    --atlas-border-strong: #323a48;
+    --atlas-border-hover: #3a4354;
+    --atlas-edge-light: #2a3140;
+    --atlas-accent-olive: #6f8054;
+    --atlas-accent-olive-hover: #7f9262;
+    --atlas-olive-bright: #8fa36d;
+    --atlas-olive-muted: #7d905f;
+    --atlas-text-primary: #e8ecf1;
+    --atlas-text-secondary: #8c97a8;
+    --atlas-text-muted: #788396;
+    --atlas-amber: #c88b32;
+    --atlas-red: #c94a4a;
+    --atlas-red-tint: #2a1518;
+    --atlas-green: #4f8f66;
+    --atlas-cyan: #4a9eb0;
+    --atlas-blue: #5682b0;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    background-color: var(--atlas-bg-primary);
+    color: var(--atlas-text-primary);
+    font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  .atlas-raised {
+    background-color: var(--atlas-bg-secondary);
+    border: 1px solid var(--atlas-border-strong);
+    box-shadow: inset 0 1px 0 0 var(--atlas-edge-light);
+  }
+
+  .atlas-led {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 0;
+    background-color: currentColor;
+    flex-shrink: 0;
+  }
+
+  .atlas-led[data-state="live"],
+  .atlas-led[data-state="nominal"] {
+    color: var(--atlas-green);
+  }
+
+  .atlas-led[data-state="critical"],
+  .atlas-led[data-state="error"] {
+    color: var(--atlas-red);
+  }
+
+  .atlas-led[data-state="idle"] {
+    color: var(--atlas-text-muted);
+  }
+
+  .atlas-led[data-state="live"],
+  .atlas-led[data-state="critical"] {
+    animation: atlas-led-pulse 2.4s ease-in-out infinite;
+  }
+
+  .atlas-led[data-state="nominal"],
+  .atlas-led[data-state="error"],
+  .atlas-led[data-state="idle"] {
+    animation: none;
+  }
+}
+
+@keyframes atlas-led-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .atlas-led {
+    animation: none;
+  }
+}
+
+/* Precision thin scrollbars for intelligence panels */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--atlas-bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--atlas-border);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--atlas-border-hover);
+}
+
+/* Override MapLibre popup/controls for dark tactical workstation theme */
+.maplibregl-ctrl-group {
+  background: var(--atlas-bg-secondary) !important;
+  border: 1px solid var(--atlas-border) !important;
+  border-radius: 2px !important;
+  box-shadow: none !important;
+}
+
+.maplibregl-ctrl-group button {
+  background-color: var(--atlas-bg-secondary) !important;
+  color: var(--atlas-text-primary) !important;
+  border-bottom: 1px solid var(--atlas-border) !important;
+}
+
+.maplibregl-ctrl-group button:hover {
+  background-color: var(--atlas-bg-hover) !important;
+}
+
+.maplibregl-ctrl-icon {
+  filter: invert(0.85);
+}

@@ -1,0 +1,23 @@
+services:
+  atlas-linux-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: atlas-linux-gateway
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8443:8443"
+    read_only: true
+    tmpfs:
+      - /tmp/atlas-worker-sandbox:rw,noexec,nosuid,nodev,size=256m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
