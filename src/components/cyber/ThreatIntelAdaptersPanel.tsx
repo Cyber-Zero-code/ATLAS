@@ -1,19 +1,28 @@
 import React, { useEffect, useState } from 'react';
 import type {
   CtiProviderId,
+  CtiProxySourceStatus,
   ExternalThreatIndicator,
   SelectedEntity,
 } from '../../types/atlas';
 import type { WorkspaceIntelligenceState } from '../../hooks/useWorkspaceIntelligence';
-import { CTI_ADAPTER_CATALOG, parseCtiJsonBundle } from '../../adapters/ctiAdapters';
+import {
+  CTI_ADAPTER_CATALOG,
+  fetchCtiProxyIndicators,
+  parseCtiJsonBundle,
+  probeCtiProxySources,
+  type ProxyCtiSourceId,
+} from '../../adapters/ctiAdapters';
+import { validateGatewayEndpointUrl } from '../../adapters/gatewayClient';
 import { atlasService } from '../../data/api';
+import { loadOrgScopedValue, saveOrgScopedValue } from '../../utils/orgStorage';
 import {
   Rss,
   Upload,
   CheckCircle2,
-  XCircle,
   AlertTriangle,
-  Lock,
+  RefreshCw,
+  Server,
   Trash2,
 } from 'lucide-react';
 
@@ -36,6 +45,12 @@ export const ThreatIntelAdaptersPanel: React.FC<ThreatIntelAdaptersPanelProps> =
   const [selectedProvider, setSelectedProvider] = useState<CtiProviderId>('STIX_2_1');
   const [parseFeedback, setParseFeedback] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
+  const [gatewayUrl, setGatewayUrl] = useState('');
+  const [proxyProbing, setProxyProbing] = useState(false);
+  const [proxySyncing, setProxySyncing] = useState<string | null>(null);
+  const [sourceStatuses, setSourceStatuses] = useState<Record<string, CtiProxySourceStatus>>({});
+  const [proxyFeedback, setProxyFeedback] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     atlasService
@@ -47,6 +62,13 @@ export const ThreatIntelAdaptersPanel: React.FC<ThreatIntelAdaptersPanelProps> =
         }
       })
       .catch((err) => console.error('Could not load external threat indicators:', err));
+
+    const saved = loadOrgScopedValue<{ endpointUrl: string }>('gateway_preferences', intel.orgId, {
+      endpointUrl: '',
+    });
+    setGatewayUrl(saved.endpointUrl || '');
+    setSourceStatuses({});
+    setProxyFeedback(null);
     setBundleText('');
     setParseFeedback(null);
     setProviderFilter('all');
@@ -56,7 +78,92 @@ export const ThreatIntelAdaptersPanel: React.FC<ThreatIntelAdaptersPanelProps> =
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intel.orgId]);
 
+  const handleProbeProxy = async (targetUrl = gatewayUrl) => {
+    setProxyFeedback(null);
+    const trimmed = targetUrl.trim();
+    if (!trimmed) {
+      saveOrgScopedValue('gateway_preferences', intel.orgId, { endpointUrl: '' });
+      setSourceStatuses({});
+      setProxyFeedback({ kind: 'err', text: 'Enter the ATLAS Execution Gateway URL before probing.' });
+      return;
+    }
+    const urlCheck = validateGatewayEndpointUrl(trimmed);
+    if (!urlCheck.valid || !urlCheck.normalized) {
+      setProxyFeedback({ kind: 'err', text: urlCheck.reason || 'Invalid gateway URL.' });
+      return;
+    }
+    saveOrgScopedValue('gateway_preferences', intel.orgId, { endpointUrl: urlCheck.normalized });
+    setGatewayUrl(urlCheck.normalized);
+    setProxyProbing(true);
+    try {
+      const list = await probeCtiProxySources(urlCheck.normalized, intel.orgId);
+      const map: Record<string, CtiProxySourceStatus> = {};
+      for (const s of list) map[s.id] = s;
+      setSourceStatuses(map);
+      const configuredCount = list.filter((s) => s.configured).length;
+      setProxyFeedback({
+        kind: 'ok',
+        text: `Gateway reachable: ${configuredCount}/${list.length} server-side CTI source(s) configured.`,
+      });
+    } catch (err: any) {
+      setProxyFeedback({ kind: 'err', text: err?.message || 'Unable to probe gateway CTI proxy.' });
+    } finally {
+      setProxyProbing(false);
+    }
+  };
 
+  const handleSyncProxy = async (sourceFilter?: ProxyCtiSourceId) => {
+    setProxyFeedback(null);
+    const urlCheck = validateGatewayEndpointUrl(gatewayUrl.trim());
+    if (!urlCheck.valid || !urlCheck.normalized) {
+      setProxyFeedback({ kind: 'err', text: urlCheck.reason || 'Configure a valid gateway URL first.' });
+      return;
+    }
+    saveOrgScopedValue('gateway_preferences', intel.orgId, { endpointUrl: urlCheck.normalized });
+    setGatewayUrl(urlCheck.normalized);
+    setProxySyncing(sourceFilter || 'ALL');
+    try {
+      const res = await fetchCtiProxyIndicators({
+        endpointUrl: urlCheck.normalized,
+        orgId: intel.orgId,
+        source: sourceFilter,
+        assets: intel.assets,
+        incidents: intel.incidents,
+        existingIndicators: indicators,
+      });
+
+      setSourceStatuses((prev) => {
+        const nextMap = { ...prev };
+        for (const s of res.sources) nextMap[s.id] = s;
+        return nextMap;
+      });
+
+      let insertedCount = 0;
+      let dbDupes = 0;
+      if (res.indicators.length > 0) {
+        const saved = await atlasService.insertExternalIndicators(intel.orgId, res.indicators);
+        insertedCount = saved.inserted.length;
+        dbDupes = saved.skippedDuplicates;
+        const next = [...saved.inserted, ...indicators];
+        setIndicators(next);
+        onIndicatorsChange?.(next);
+      }
+
+      const failNote =
+        res.failedSources.length > 0
+          ? ` Partial failures: ${res.failedSources.map((f) => `${f.source} (${f.reason})`).join('; ')}.`
+          : '';
+
+      setProxyFeedback({
+        kind: res.failedSources.length > 0 && insertedCount === 0 ? 'err' : 'ok',
+        text: `Synced ${insertedCount} new indicator(s) via gateway CTI proxy (${res.skippedDuplicates + dbDupes} duplicates skipped; 15m server cache TTL).${failNote}`,
+      });
+    } catch (err: any) {
+      setProxyFeedback({ kind: 'err', text: err?.message || 'CTI proxy sync failed.' });
+    } finally {
+      setProxySyncing(null);
+    }
+  };
 
   const handleIngestText = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -129,8 +236,6 @@ export const ThreatIntelAdaptersPanel: React.FC<ThreatIntelAdaptersPanelProps> =
       }
     }
     if (failed > 0) {
-      // Restore whatever still exists (deletes are admin-only; non-admins will see most or all
-      // removals rejected and the list reappear).
       try {
         const rows = await atlasService.fetchExternalIndicators(intel.orgId);
         setIndicators(rows);
@@ -170,7 +275,7 @@ export const ThreatIntelAdaptersPanel: React.FC<ThreatIntelAdaptersPanelProps> =
           </div>
           <h1 className="text-sm font-semibold text-[#e8ecf1] flex items-center gap-2 mt-0.5">
             <Rss className="w-4 h-4 text-[#4a9eb0]" />
-            <span>CTI Feed Adapters & STIX 2.1 / CISA KEV Ingestion</span>
+            <span>CTI Feed Adapters &amp; Gateway Proxy Sync</span>
           </h1>
         </div>
         <span className="font-mono text-[10px] text-[#c88b32] border border-[#c88b32]/40 bg-[#c88b32]/10 px-2 py-0.5">
@@ -178,33 +283,118 @@ export const ThreatIntelAdaptersPanel: React.FC<ThreatIntelAdaptersPanelProps> =
         </span>
       </div>
 
+      {/* Gateway CTI Proxy Controls */}
+      <div className="bg-[#12151b] border border-[#252b36] p-3 space-y-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 font-mono text-xs font-semibold text-[#e8ecf1]">
+            <Server className="w-3.5 h-3.5 text-[#4a9eb0]" />
+            <span>SERVER-SIDE CTI PROXY RELAY (GET /api/v1/cti/indicators)</span>
+          </div>
+          <span className="font-mono text-[10px] text-[#8c97a8]">
+            Feed API keys remain on the Linux gateway; browser sends only your AAL2 session JWT
+          </span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
+          <input
+            type="url"
+            value={gatewayUrl}
+            onChange={(e) => setGatewayUrl(e.target.value)}
+            placeholder="https://gateway.internal:8443 or http://127.0.0.1:8443"
+            className="flex-1 min-w-[260px] bg-[#0b0d10] border border-[#252b36] px-2.5 py-1.5 text-xs text-[#e8ecf1] focus:outline-none focus:border-[#6f8054]"
+          />
+          <button
+            type="button"
+            disabled={proxyProbing || Boolean(proxySyncing)}
+            onClick={() => handleProbeProxy()}
+            className="px-2.5 py-1.5 bg-[#181c24] hover:bg-[#222834] border border-[#252b36] text-[#e8ecf1] cursor-pointer disabled:opacity-40"
+          >
+            {proxyProbing ? 'Probing…' : 'Probe Gateway'}
+          </button>
+          <button
+            type="button"
+            disabled={!gatewayUrl.trim() || proxyProbing || Boolean(proxySyncing)}
+            onClick={() => handleSyncProxy()}
+            className="px-3 py-1.5 bg-[#6f8054] hover:bg-[#7d905f] text-[#0b0d10] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
+          >
+            <RefreshCw className={`w-3 h-3 ${proxySyncing === 'ALL' ? 'animate-spin' : ''}`} />
+            <span>{proxySyncing === 'ALL' ? 'Syncing Proxy Feeds…' : 'Sync Configured Feeds'}</span>
+          </button>
+        </div>
+
+        {proxyFeedback && (
+          <div
+            className={`p-2 border font-mono text-[11px] flex items-center gap-2 ${
+              proxyFeedback.kind === 'ok'
+                ? 'bg-[#4f8f66]/10 border-[#4f8f66]/40 text-[#4f8f66]'
+                : 'bg-[#c94a4a]/10 border-[#c94a4a]/40 text-[#c94a4a]'
+            }`}
+          >
+            {proxyFeedback.kind === 'ok' ? (
+              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+            )}
+            <span>{proxyFeedback.text}</span>
+          </div>
+        )}
+      </div>
+
       {/* Adapter Catalog Matrix */}
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
         {CTI_ADAPTER_CATALOG.map((adp) => {
           const count = indicators.filter((i) => i.providerId === adp.id).length;
+          const liveStatus = adp.requiresServerProxy ? sourceStatuses[adp.id] : undefined;
+
+          let badgeLabel = 'LOCAL FILE INGEST (UNVERIFIED)';
+          let badgeColor = 'text-[#4a9eb0]';
+          if (adp.requiresServerProxy) {
+            if (!liveStatus) {
+              badgeLabel = 'PROXY READY (NOT PROBED)';
+              badgeColor = 'text-[#8c97a8]';
+            } else if (!liveStatus.configured || liveStatus.state === 'unconfigured') {
+              badgeLabel = 'UNCONFIGURED ON GATEWAY';
+              badgeColor = 'text-[#8c97a8]';
+            } else if (liveStatus.state === 'configured') {
+              badgeLabel = 'PROXY CONFIGURED';
+              badgeColor = 'text-[#4a9eb0]';
+            } else if (liveStatus.state === 'live') {
+              badgeLabel = liveStatus.cached ? 'LIVE (CACHED)' : 'LIVE';
+              badgeColor = 'text-[#4f8f66]';
+            } else if (liveStatus.state === 'failing') {
+              badgeLabel = 'FAILING';
+              badgeColor = 'text-[#c94a4a]';
+            }
+          }
+
           return (
             <div key={adp.id} className="bg-[#12151b] border border-[#252b36] p-3 space-y-1.5 flex flex-col justify-between">
               <div className="space-y-1">
                 <div className="flex items-center justify-between gap-2 font-mono text-[11px]">
                   <span className="text-[#e8ecf1] font-semibold truncate">{adp.name}</span>
-                  {adp.requiresServerProxy ? (
-                    <span className="text-[10px] text-[#c88b32] flex items-center gap-1 shrink-0">
-                      <Lock className="w-3 h-3" />
-                      <span>DEFERRED — Phase 2</span>
-                    </span>
-                  ) : (
-                    <span className="text-[10px] text-[#4a9eb0] shrink-0">LOCAL FILE INGEST (UNVERIFIED)</span>
-                  )}
+                  <span className={`text-[10px] shrink-0 font-semibold ${badgeColor}`}>{badgeLabel}</span>
                 </div>
                 <div className="font-mono text-[10px] text-[#4a9eb0]">{adp.protocol}</div>
                 <p className="text-[11px] text-[#8c97a8] leading-relaxed">{adp.description}</p>
-                {adp.requiresServerProxy && adp.deferredExplanation && (
-                  <p className="text-[11px] text-[#c88b32] leading-snug">{adp.deferredExplanation}</p>
+                {liveStatus?.error && (
+                  <p className="text-[11px] text-[#c94a4a] font-mono leading-snug">{liveStatus.error}</p>
                 )}
               </div>
               <div className="pt-2 border-t border-[#1e242e] font-mono text-[10px] space-y-1">
                 <div className="text-[#8c97a8]">{adp.credentialRequirement}</div>
-                <div className="text-[#e8ecf1] tabular-nums">LOADED INDICATORS: {count}</div>
+                <div className="flex items-center justify-between gap-2 pt-0.5">
+                  <span className="text-[#e8ecf1] tabular-nums">LOADED INDICATORS: {count}</span>
+                  {adp.requiresServerProxy && gatewayUrl.trim() && (
+                    <button
+                      type="button"
+                      disabled={Boolean(proxySyncing) || liveStatus?.configured === false}
+                      onClick={() => handleSyncProxy(adp.id as ProxyCtiSourceId)}
+                      className="px-2 py-0.5 bg-[#0b0d10] hover:bg-[#181c24] border border-[#252b36] text-[#4a9eb0] cursor-pointer disabled:opacity-40"
+                    >
+                      {proxySyncing === adp.id ? 'Syncing…' : 'Sync Feed'}
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           );
@@ -256,7 +446,7 @@ export const ThreatIntelAdaptersPanel: React.FC<ThreatIntelAdaptersPanelProps> =
               disabled={!bundleText.trim()}
               className="px-3 py-1 bg-[#6f8054] hover:bg-[#7d905f] text-[#0b0d10] font-semibold cursor-pointer disabled:opacity-40"
             >
-              Parse & Correlate Bundle
+              Parse &amp; Correlate Bundle
             </button>
           </div>
         </form>
@@ -326,7 +516,7 @@ export const ThreatIntelAdaptersPanel: React.FC<ThreatIntelAdaptersPanelProps> =
             {visibleIndicators.length === 0 ? (
               <tr>
                 <td colSpan={7} className="py-6 text-center text-[#8c97a8] font-sans">
-                  No external threat intelligence bundles loaded yet. Load a STIX 2.1 or CISA KEV JSON bundle above to cross-reference against workspace assets.
+                  No external threat intelligence indicators loaded yet. Sync configured feeds through the gateway proxy or load a local STIX 2.1 / CISA KEV JSON bundle above.
                 </td>
               </tr>
             ) : (

@@ -1,0 +1,10 @@
+# Project ATLAS Gateway Reverse Proxy Configuration (Caddy)
+#
+# Terminates automatic HTTPS for the domain set in ATLAS_GATEWAY_DOMAIN and
+# forwards authenticated API traffic exclusively to the gateway bound on 127.0.0.1.
+# Ensure GATEWAY_HOST=127.0.0.1 and GATEWAY_PORT=8443 in /etc/atlas-gateway/env,
+# and load /etc/atlas-gateway/env into Caddy via its systemd drop-in override.
+
+{$ATLAS_GATEWAY_DOMAIN} {
+	reverse_proxy 127.0.0.1:8443
+}

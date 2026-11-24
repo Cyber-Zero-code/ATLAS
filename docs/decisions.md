@@ -40,8 +40,41 @@
 - **Decision:** Private Supabase Storage bucket `evidence`. Path convention is `<org_id>/<target_type>/<file_name>`. Storage object RLS policies verify that the first path segment matches the user's authorised organisation ID and that `aal = 'aal2'`.
 - **Integrity:** SHA-256 calculated client-side via native Web Crypto (`crypto.subtle.digest`) prior to upload and stored in `evidence` with immutable `custody_events`.
 
-### ADR 006: Language and Claims Governance
-- **Decision:** Strictly avoid "forensic", "defence-grade", or "predictive". Use "evidence management". Outputs are review signals with uncertainty. Never attribute actions to named persons or threat actors. No offensive targeting or attack simulation.
+### ADR 006: Language and Claims Governance (Amended for ADR 010)
+- **Decision:** Strictly avoid "forensic", "defence-grade", or "predictive". Use "evidence management". Outputs are review signals with uncertainty. Never attribute cyber/threat-intel actions to named persons or threat actors, except for authorised site camera biometric/person-tracking detections and alerts explicitly permitted under **ADR 010 (Amended)**. No offensive targeting or attack simulation.
 
-### ADR 007: Live Threat Intelligence Feeds Deferred to Phase 2
-- **Decision:** Live external CTI feed adapters requiring a server-side proxy (`MISP`, `TAXII_2_1`, `ALIENVAULT_OTX`, `ABUSE_CH`) are explicitly deferred to Phase 2 (`DEFERRED — Phase 2`) because Phase 1 excludes TAXII/STIX feed ingest (`CLAUDE.md`) and has no server-side credentialed CTI proxy, so only local operator-supplied STIX 2.1 / CISA KEV JSON bundle parsing runs without browser requests to external feeds.
+### ADR 007: Live Threat Intelligence Feeds Deferred to Phase 2 (CTI Proxy Boundary)
+- **Date:** 2026-11-23
+- **Approver:** Developer
+- **Decision:** Live external CTI feed adapters requiring a server-side proxy (`MISP`, `TAXII_2_1`, `ALIENVAULT_OTX`, `ABUSE_CH`) are deferred to Phase 2 (`DEFERRED — Phase 2`). When implemented, live feed polling must run strictly through the authenticated CTI proxy inside `gateway/`, while Phase 1 parses only local operator-supplied STIX 2.1 / CISA KEV JSON bundles with zero direct browser requests to external feeds.
+- **Reason:** Per `CLAUDE.md`, automated STIX/TAXII feed ingest is deferred beyond Phase 1, and external CTI APIs require server-side credential injection and CORS isolation rather than exposing API keys in browser code.
+
+### ADR 008: Public Basemap Tiles Permitted Only Through Gateway Tile Proxy
+- **Date:** 2026-11-23
+- **Approver:** Developer
+- **Decision:** Replace the locked rule "No public tile servers" in `CLAUDE.md` with: public raster or vector tile servers are permitted, requested only through the `gateway/` tile proxy (to be added in a later commit), subject to:
+  - Tile requests carry only the `z`/`x`/`y` tile coordinates of the visible viewport and never contain asset coordinates, site codes, incident identifiers, or any value derived from a sensitive asset.
+  - The client never contacts the tile provider directly; all tile requests go through the gateway.
+  - The proxy caches tiles and does not forward client IP addresses or user identifiers to the provider.
+  - Sensitive-location controls in `docs/threat-model.md` Section 3 remain in force; accuracy halos and approximate labels are unchanged.
+- **Reason:** Analysts require optional geographic basemap context beyond a blank canvas during incident response, while strict `gateway/` proxying, caching, and header stripping prevent direct client tracking or asset-level telemetry leakage to third-party tile providers.
+
+### ADR 009: Custom Server Permitted Strictly Within `gateway/` (Linux Gateway, CTI Proxy, Tile Proxy, Registered Camera Stream Decoding)
+- **Date:** 2026-11-23
+- **Approver:** Developer
+- **Decision:** Replace "No custom server" in `CLAUDE.md` with: a custom server is permitted only for the Linux execution gateway, the CTI proxy, the tile proxy, and bounded registered-camera RTSP decoding/vision analytics, all in `gateway/`. Each must authenticate every request with the existing JWT, AAL2, and membership checks. Browser code continues to hold only the public Supabase `anon` key.
+- **Reason:** Executing approved defensive Linux tools, mediating authenticated external CTI APIs, proxying/caching basemap tiles, and decoding RTSP camera streams without exposing stream credentials cannot be done safely in client-side browser code, whereas consolidating these bounded components in `gateway/` keeps all application tenancy, persistence, and audit authority in Supabase PostgreSQL.
+
+### ADR 010: Authorised Camera Stream Decoding & Analytics Scope (Amended)
+- **Date:** 2026-11-23
+- **Approver:** Developer
+- **Decision:** Camera stream decoding and vision analytics in `gateway/` are permitted under the following rules:
+  - Only cameras registered by an organisation for sites that organisation owns or is contracted to secure may be decoded. Cross-organisation camera viewing is strictly prohibited (`HTTP 403`). Public third-party camera feeds remain prohibited.
+  - **Biometric & Person Analytics Permitted (Amended):** Face detection, face recognition, biometric processing, person detection/counting, cross-camera individual tracking, and automatic person-identifying alerts are permitted for authorised site deployments using ML/inference runtimes or gateway-configured analytics workers.
+  - **Bounded Decoding & Default Non-Retention:** `gateway/` pulls RTSP via `ffmpeg` in a bounded child process (1 frame every 5 seconds), keeping only the latest frame in memory when retention is `none` (default). Any retention setting (`none` or bounded retention duration) is configured per camera; expired frames are deleted automatically and every deletion is written to the audit ledger.
+  - **Access & Mandatory Audit:** Viewing live frames requires valid JWT, AAL2 MFA, workspace membership, and camera-view role authorisation. Every frame request is written to the audit ledger with user, camera, and timestamp.
+  - **Credential Protection:** Stream URLs and embedded credentials are never sent to the browser or written to logs.
+  - **Legal Basis & Admin Override (Amended):** Operators should record a `legal_basis_ref` per camera deployment; however, a camera without a `legal_basis_ref` may be activated if an `atlas:admin` explicitly accepts/acknowledges activation without a legal basis reference (recorded in the audit ledger).
+- **Reason:** Authorised physical-security operators require live frame verification alongside registered camera FOV overlays, configurable site-security person/face alerting, strict multi-tenant isolation, credential hiding, and full auditability.
+
+

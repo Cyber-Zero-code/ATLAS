@@ -250,6 +250,77 @@ export class GatewayJobManager {
     });
   }
 
+  public readonly defaultCameraDecodeTimeoutMs = 15_000;
+
+  /**
+   * Executes bounded binary frame capture (`ffmpeg -f image2pipe ... pipe:1`)
+   * using GatewayJobManager's child-process timeout (SIGTERM -> SIGKILL) and byte limits.
+   */
+  public runCameraFrameCapture(
+    binaryPath: string,
+    fixedArgs: string[],
+    maxRuntimeMs = this.defaultCameraDecodeTimeoutMs,
+    maxFrameBytes = 4 * 1024 * 1024
+  ): Promise<{ exitCode: number | null; frameBuffer: Buffer; stderr: string; timedOut?: boolean }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(binaryPath, fixedArgs, {
+        shell: false,
+        env: {
+          PATH: '/usr/local/bin:/usr/bin:/bin',
+          LANG: 'C.UTF-8',
+          HOME: this.workDir,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let outBytes = 0;
+      let errBytes = 0;
+      const outChunks: Buffer[] = [];
+      const errChunks: Buffer[] = [];
+      let timedOut = false;
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGTERM');
+        setTimeout(() => {
+          if (!child.killed) child.kill('SIGKILL');
+        }, 1500);
+      }, maxRuntimeMs);
+
+      child.stdout?.on('data', (chunk: Buffer) => {
+        if (outBytes < maxFrameBytes) {
+          const allowed = chunk.subarray(0, maxFrameBytes - outBytes);
+          outChunks.push(allowed);
+          outBytes += allowed.length;
+        }
+      });
+
+      child.stderr?.on('data', (chunk: Buffer) => {
+        if (errBytes < 16384) {
+          const allowed = chunk.subarray(0, 16384 - errBytes);
+          errChunks.push(allowed);
+          errBytes += allowed.length;
+        }
+      });
+
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        resolve({
+          exitCode: code,
+          frameBuffer: Buffer.concat(outChunks),
+          stderr: Buffer.concat(errChunks).toString('utf8'),
+          timedOut,
+        });
+      });
+    });
+  }
+
+
   public async startJob(
     auth: AuthenticatedContext,
     rawReq: GatewayJobRequest,

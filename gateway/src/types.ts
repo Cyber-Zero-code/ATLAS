@@ -14,6 +14,157 @@ export interface AuthenticatedContext {
   tokenExpiresAt: number;
 }
 
+export type CtiSourceId = 'ALIENVAULT_OTX' | 'ABUSE_CH' | 'MISP' | 'TAXII_2_1';
+
+export type NormalizedCtiIndicatorType =
+  | 'ip'
+  | 'cidr'
+  | 'domain'
+  | 'hostname'
+  | 'url'
+  | 'hash'
+  | 'certificate'
+  | 'malware'
+  | 'threat_actor'
+  | 'cve';
+
+export interface CtiConfig {
+  otxApiKey?: string;
+  abuseChAuthKey?: string;
+  mispUrl?: string;
+  mispApiKey?: string;
+  taxiiApiRoot?: string;
+  taxiiCollectionId?: string;
+}
+
+export interface NormalizedCtiIndicator {
+  type: NormalizedCtiIndicatorType;
+  value: string;
+  source: CtiSourceId;
+  source_ref: string;
+  first_seen: string;
+  last_seen: string | null;
+  confidence: number;
+  tags: string[];
+}
+
+export interface CtiSourceStatus {
+  id: CtiSourceId;
+  configured: boolean;
+  state: 'unconfigured' | 'live' | 'failing';
+  cached: boolean;
+  indicatorCount: number;
+  error?: string;
+  checkedAtUtc?: string;
+}
+
+export interface CtiFailedSource {
+  source: CtiSourceId;
+  reason: string;
+}
+
+export interface CameraAnalyticsConfig {
+  analyticsUrl?: string;
+  analyticsApiKey?: string;
+}
+
+export type CameraRetentionSetting = 'none' | '1h' | '24h' | '7d' | '30d';
+export type CameraProtocol = 'ONVIF' | 'RTSP_WEBRTC' | 'RTSP_HLS';
+export type CameraStreamState = 'registered' | 'streaming' | 'offline' | 'stopped';
+
+export interface CameraRegistrationInput {
+  cameraId?: string;
+  siteId?: string;
+  siteCode?: string;
+  cameraCode: string;
+  name: string;
+  protocol: CameraProtocol;
+  streamUrl: string;
+  retentionSetting?: CameraRetentionSetting;
+  legalBasisRef?: string;
+  adminAcceptWithoutLegalBasis?: boolean;
+  autoStart?: boolean;
+}
+
+export interface CameraBoundingBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface CameraFaceObservation {
+  confidence: number;
+  box: CameraBoundingBox;
+  recognizedIdentityId?: string;
+  recognizedLabel?: string;
+  biometricSimilarity?: number;
+}
+
+export interface CameraPersonObservation {
+  trackId: string;
+  confidence: number;
+  box: CameraBoundingBox;
+  identityId?: string;
+  personLabel?: string;
+  crossCameraSeenIn?: string[];
+}
+
+export interface CameraPersonAlert {
+  alertId: string;
+  cameraId: string;
+  cameraCode: string;
+  personLabel: string;
+  identityId?: string;
+  trackId?: string;
+  confidence: number;
+  reason: string;
+  triggeredAtUtc: string;
+}
+
+export interface CameraAnalyticsResult {
+  status: 'ANALYZED' | 'ANALYTICS_UNAVAILABLE';
+  unavailableReason?: string;
+  analyzedAtUtc: string;
+  faceCount: number;
+  personCount: number;
+  faces: CameraFaceObservation[];
+  persons: CameraPersonObservation[];
+  alerts: CameraPersonAlert[];
+}
+
+export interface SanitizedCameraRecord {
+  cameraId: string;
+  orgId: string;
+  siteId?: string;
+  siteCode?: string;
+  cameraCode: string;
+  name: string;
+  protocol: CameraProtocol;
+  retentionSetting: CameraRetentionSetting;
+  legalBasisRef?: string;
+  adminAcceptedWithoutLegalBasis: boolean;
+  adminAcceptedBy?: string;
+  status: CameraStreamState;
+  consecutiveFailures: number;
+  offlineReason?: string;
+  lastFrameAtUtc?: string;
+  hasLatestFrame: boolean;
+  storedFramesCount: number;
+  latestAnalytics?: CameraAnalyticsResult;
+}
+
+export interface CameraAuditRecord {
+  id: string;
+  orgId: string;
+  userId: string;
+  actorRole: string;
+  action: 'CAMERA_FRAME_VIEW' | 'CAMERA_RETENTION_DELETE' | 'CAMERA_LEGAL_OVERRIDE' | 'CAMERA_PERSON_ALERT';
+  cameraId: string;
+  observedAtUtc: string;
+  details: Record<string, unknown>;
+}
+
 export interface GatewayConfig {
   host: string;
   port: number;
@@ -31,6 +182,8 @@ export interface GatewayConfig {
   workDir: string;
   maxConcurrentJobs: number;
   maxPcapBytes: number;
+  cti?: CtiConfig;
+  cameraAnalytics?: CameraAnalyticsConfig;
 }
 
 export interface LinuxToolDescriptor {

@@ -2,17 +2,26 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   AppRole,
   CameraRegistryItem,
+  CameraRetentionSetting,
+  GatewayCameraRecord,
   GisCustomSource,
   ModuleId,
   SelectedEntity,
 } from '../../types/atlas';
 import { WorkspaceIntelligenceState } from '../../hooks/useWorkspaceIntelligence';
 import { validateGisSourceInput } from '../../utils/intelligence';
+import { loadOrgScopedValue, saveOrgScopedValue } from '../../utils/orgStorage';
+import { validateGatewayEndpointUrl } from '../../adapters/gatewayClient';
 import {
   CAMERA_GATEWAY_ADAPTERS,
   GIS_SOURCE_ADAPTER_CATALOG,
   buildCamerasGeoJson,
-  validateAuthorisedEndpointUrl,
+  fetchGatewayCameraAnalytics,
+  fetchGatewayCameraFrameBlob,
+  listGatewayCameras,
+  registerAndStartGatewayCamera,
+  stopGatewayCamera,
+  validateCameraStreamUrlForGateway,
 } from '../../adapters/gisSurveillanceAdapters';
 import {
   analyzeBufferZone,
@@ -46,6 +55,9 @@ import {
   Info,
   Video,
   Radar,
+  Play,
+  Square,
+  RefreshCw,
 } from 'lucide-react';
 
 interface GeointWorkspaceProps {
@@ -126,10 +138,11 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
   const [newSrcUrl, setNewSrcUrl] = useState('');
   const [gisFormError, setGisFormError] = useState<string | null>(null);
 
-  // Module C: Surveillance Camera Registry State (per-org database table, migration 018)
+  // Module C: Surveillance Camera Registry + Bounded Gateway Stream State
   const [cameras, setCameras] = useState<CameraRegistryItem[]>([]);
   const [camCode, setCamCode] = useState('');
   const [camName, setCamName] = useState('');
+  const [camSiteId, setCamSiteId] = useState('');
   const [camProtocol, setCamProtocol] = useState<CameraRegistryItem['protocol']>('RTSP_HLS');
   const [camLat, setCamLat] = useState('28.6139');
   const [camLng, setCamLng] = useState('77.2090');
@@ -137,10 +150,33 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
   const [camFov, setCamFov] = useState('70');
   const [camRangeM, setCamRangeM] = useState('350');
   const [camUrl, setCamUrl] = useState('');
+  const [camRetention, setCamRetention] = useState<CameraRetentionSetting>('none');
+  const [camLegalBasisRef, setCamLegalBasisRef] = useState('');
+  const [camAdminOverride, setCamAdminOverride] = useState(false);
   const [camError, setCamError] = useState<string | null>(null);
+
+  // Gateway connection & transient stream controls (raw stream URL with creds NEVER saved in browser storage)
+  const [camGatewayUrl, setCamGatewayUrl] = useState<string>(() =>
+    loadOrgScopedValue<{ endpointUrl?: string }>('gateway_preferences', intel.orgId, {}).endpointUrl || ''
+  );
+  const [transientStreamUrls, setTransientStreamUrls] = useState<Record<string, string>>({});
+  const [gatewayCameras, setGatewayCameras] = useState<Record<string, GatewayCameraRecord>>({});
+  const [activeViewerCamId, setActiveViewerCamId] = useState<string | null>(null);
+  const [liveFrameObjectUrl, setLiveFrameObjectUrl] = useState<string | null>(null);
+  const [streamBusyId, setStreamBusyId] = useState<string | null>(null);
+  const [streamNotice, setStreamNotice] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    const savedGw =
+      loadOrgScopedValue<{ endpointUrl?: string }>('gateway_preferences', intel.orgId, {}).endpointUrl || '';
+    setCamGatewayUrl(savedGw);
+    setTransientStreamUrls({});
+    setGatewayCameras({});
+    setActiveViewerCamId(null);
+    setLiveFrameObjectUrl(null);
+    setStreamNotice(null);
+
     atlasService
       .fetchCameras(intel.orgId)
       .then((rows) => {
@@ -149,7 +185,11 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
       .catch((err) => console.error('Could not load camera registry:', err));
     setCamCode('');
     setCamName('');
+    setCamSiteId('');
     setCamUrl('');
+    setCamRetention('none');
+    setCamLegalBasisRef('');
+    setCamAdminOverride(false);
     setCamError(null);
     setGisFormError(null);
     setNewSrcName('');
@@ -162,10 +202,172 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
     };
   }, [intel.orgId]);
 
-  // Diffs the previous and requested camera lists (both call sites below either prepend one new
-  // camera or remove one by id) and applies exactly that one change in the database. Optimistic:
-  // the screen updates immediately and reverts if the database refuses the change.
-  const persistCameras = (next: CameraRegistryItem[]) => {
+  // Revoke previous JPEG Object URL safely on change/unmount
+  useEffect(() => {
+    return () => {
+      if (liveFrameObjectUrl) {
+        URL.revokeObjectURL(liveFrameObjectUrl);
+      }
+    };
+  }, [liveFrameObjectUrl]);
+
+  const refreshGatewayCameraState = async (gwUrlInput = camGatewayUrl) => {
+    if (!gwUrlInput.trim()) return;
+    try {
+      const check = validateGatewayEndpointUrl(gwUrlInput);
+      if (!check.valid || !check.normalized) {
+        setStreamNotice(check.reason || 'Invalid gateway URL.');
+        return;
+      }
+      saveOrgScopedValue('gateway_preferences', intel.orgId, { endpointUrl: check.normalized });
+      const res = await listGatewayCameras(check.normalized, intel.orgId);
+      const map: Record<string, GatewayCameraRecord> = {};
+      for (const gc of res.cameras) {
+        map[gc.cameraId] = gc;
+      }
+      setGatewayCameras(map);
+      setStreamNotice(null);
+    } catch (err: any) {
+      setStreamNotice(err?.message || 'Unable to query gateway camera streams.');
+    }
+  };
+
+  // Poll latest JPEG frame + analytics every 5s when viewing an actively streaming camera
+  useEffect(() => {
+    if (!activeViewerCamId || !camGatewayUrl.trim()) return;
+    const activeGwCam = gatewayCameras[activeViewerCamId];
+    if (!activeGwCam || activeGwCam.status !== 'streaming') return;
+
+    let cancelled = false;
+    const pollFrameAndAnalytics = async () => {
+      try {
+        const [blob, meta] = await Promise.all([
+          fetchGatewayCameraFrameBlob({
+            gatewayUrl: camGatewayUrl,
+            orgId: intel.orgId,
+            cameraId: activeViewerCamId,
+          }),
+          fetchGatewayCameraAnalytics({
+            gatewayUrl: camGatewayUrl,
+            orgId: intel.orgId,
+            cameraId: activeViewerCamId,
+          }),
+        ]);
+        if (cancelled) return;
+        const nextUrl = URL.createObjectURL(blob);
+        setLiveFrameObjectUrl(nextUrl);
+        setGatewayCameras((prev) => ({ ...prev, [activeViewerCamId]: meta }));
+        setStreamNotice(null);
+      } catch (err: any) {
+        if (cancelled) return;
+        setStreamNotice(err?.message || 'Frame polling paused.');
+        try {
+          const meta = await fetchGatewayCameraAnalytics({
+            gatewayUrl: camGatewayUrl,
+            orgId: intel.orgId,
+            cameraId: activeViewerCamId,
+          });
+          if (!cancelled) {
+            setGatewayCameras((prev) => ({ ...prev, [activeViewerCamId]: meta }));
+          }
+        } catch {
+          // ignore secondary status fetch failure
+        }
+      }
+    };
+
+    void pollFrameAndAnalytics();
+    const timer = setInterval(() => {
+      void pollFrameAndAnalytics();
+    }, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeViewerCamId, gatewayCameras[activeViewerCamId || '']?.status, camGatewayUrl, intel.orgId]);
+
+  const handleStartGatewayStream = async (cam: CameraRegistryItem) => {
+    setCamError(null);
+    setStreamNotice(null);
+    const streamInput = (transientStreamUrls[cam.id] || cam.endpointUrl || '').trim();
+    if (!camGatewayUrl.trim()) {
+      setStreamNotice('Enter a verified Execution Gateway URL above before starting live RTSP decoding.');
+      return;
+    }
+    if (!streamInput) {
+      setStreamNotice(`Enter the RTSP/HTTPS stream URL for ${cam.cameraCode} to connect.`);
+      return;
+    }
+    setStreamBusyId(cam.id);
+    try {
+      const check = validateGatewayEndpointUrl(camGatewayUrl);
+      if (!check.valid || !check.normalized) {
+        throw new Error(check.reason || 'Invalid gateway URL.');
+      }
+      saveOrgScopedValue('gateway_preferences', intel.orgId, { endpointUrl: check.normalized });
+
+      const gwCam = await registerAndStartGatewayCamera({
+        gatewayUrl: check.normalized,
+        orgId: intel.orgId,
+        camera: cam,
+        streamUrl: streamInput,
+        retentionSetting: cam.retentionSetting || 'none',
+        adminAcceptWithoutLegalBasis: isAdmin && (camAdminOverride || Boolean(cam.adminAcceptedWithoutLegalBasis)),
+      });
+      setGatewayCameras((prev) => ({ ...prev, [cam.id]: gwCam }));
+      setActiveViewerCamId(cam.id);
+      setCenterTarget([cam.lng, cam.lat]);
+
+      if (gwCam.hasLatestFrame) {
+        const blob = await fetchGatewayCameraFrameBlob({
+          gatewayUrl: check.normalized,
+          orgId: intel.orgId,
+          cameraId: cam.id,
+        });
+        setLiveFrameObjectUrl(URL.createObjectURL(blob));
+      }
+
+      const updated = await atlasService.updateCameraState(intel.orgId, cam.id, {
+        connectionState: gwCam.status === 'streaming' ? 'operational' : gwCam.status === 'offline' ? 'offline' : 'configured',
+        streamStatus:
+          gwCam.status === 'streaming'
+            ? 'STREAMING VIA GATEWAY (1 FRAME / 5s)'
+            : gwCam.offlineReason || 'STREAM STOPPED',
+        adminAcceptedWithoutLegalBasis: gwCam.adminAcceptedWithoutLegalBasis,
+        lastStreamError: gwCam.offlineReason || null,
+      });
+      setCameras((cur) => cur.map((c) => (c.id === cam.id ? updated : c)));
+    } catch (err: any) {
+      setStreamNotice(err?.message || 'Could not start camera stream.');
+    } finally {
+      setStreamBusyId(null);
+    }
+  };
+
+  const handleStopGatewayStream = async (cam: CameraRegistryItem) => {
+    if (!camGatewayUrl.trim()) return;
+    setStreamBusyId(cam.id);
+    try {
+      const gwCam = await stopGatewayCamera({
+        gatewayUrl: camGatewayUrl,
+        orgId: intel.orgId,
+        cameraId: cam.id,
+      });
+      setGatewayCameras((prev) => ({ ...prev, [cam.id]: gwCam }));
+      const updated = await atlasService.updateCameraState(intel.orgId, cam.id, {
+        connectionState: 'configured',
+        streamStatus: 'STOPPED BY OPERATOR',
+      });
+      setCameras((cur) => cur.map((c) => (c.id === cam.id ? updated : c)));
+    } catch (err: any) {
+      setStreamNotice(err?.message || 'Could not stop camera stream.');
+    } finally {
+      setStreamBusyId(null);
+    }
+  };
+
+  // Diffs the previous and requested camera lists and applies changes in Supabase.
+  const persistCameras = (next: CameraRegistryItem[], rawStreamUrlForMemory?: string) => {
     const prevIds = new Set(cameras.map((c) => c.id));
     const nextIds = new Set(next.map((c) => c.id));
     const added = next.filter((c) => !prevIds.has(c.id));
@@ -178,9 +380,16 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
         for (const cam of added) {
           const saved = await atlasService.insertCamera(intel.orgId, cam);
           setCameras((cur) => cur.map((c) => (c.id === cam.id ? saved : c)));
+          if (rawStreamUrlForMemory) {
+            setTransientStreamUrls((prev) => ({ ...prev, [saved.id]: rawStreamUrlForMemory }));
+          }
         }
         for (const id of removedIds) {
           await atlasService.deleteCamera(intel.orgId, id);
+          if (activeViewerCamId === id) {
+            setActiveViewerCamId(null);
+            setLiveFrameObjectUrl(null);
+          }
         }
       } catch (err: any) {
         console.error(err);
@@ -203,16 +412,20 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
       setCamError('Valid WGS84 latitude [-90..90] and longitude [-180..180] are required.');
       return;
     }
-    if (camUrl.trim()) {
-      const check = validateAuthorisedEndpointUrl(camUrl);
+    const rawStreamInput = camUrl.trim();
+    if (rawStreamInput) {
+      const check = validateCameraStreamUrlForGateway(rawStreamInput);
       if (!check.valid) {
-        setCamError(check.reason || 'Invalid camera stream endpoint URL.');
+        setCamError(check.reason || 'Invalid camera stream URL.');
         return;
       }
     }
-    const hasUrl = Boolean(camUrl.trim());
+    const linkedSite = intel.assets.find((a) => a.id === camSiteId);
+    const hasUrl = Boolean(rawStreamInput);
     const newCam: CameraRegistryItem = {
       id: `cam-${Date.now()}`,
+      siteId: linkedSite?.id,
+      siteCode: linkedSite?.site_code,
       cameraCode: camCode.trim(),
       name: camName.trim(),
       protocol: camProtocol,
@@ -221,16 +434,21 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
       bearingDeg: Number(camBearing) || 0,
       fovDeg: Math.max(10, Math.min(180, Number(camFov) || 60)),
       rangeMeters: Math.max(20, Math.min(5000, Number(camRangeM) || 250)),
+      retentionSetting: camRetention,
+      legalBasisRef: camLegalBasisRef.trim() || undefined,
+      adminAcceptedWithoutLegalBasis: isAdmin && camAdminOverride,
       connectionState: hasUrl ? 'configured' : 'registered',
       streamStatus: hasUrl
-        ? 'CONFIGURED (HTTPS ENDPOINT ONLY — NOT CONNECTED / NO STREAM DECODE)'
-        : 'REGISTERED (METADATA & CALCULATED FOV ESTIMATE ONLY — NOT CONNECTED)',
-      endpointUrl: camUrl.trim() || undefined,
+        ? `REGISTERED (${camProtocol} STREAM — READY FOR GATEWAY START)`
+        : 'REGISTERED (METADATA & CALCULATED FOV ESTIMATE ONLY)',
+      endpointUrl: rawStreamInput || undefined,
     };
-    persistCameras([newCam, ...cameras]);
+    persistCameras([newCam, ...cameras], rawStreamInput || undefined);
     setCamCode('');
     setCamName('');
     setCamUrl('');
+    setCamLegalBasisRef('');
+    setCamAdminOverride(false);
   };
 
   // Asset Tracking search/filter state
@@ -728,49 +946,127 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
               </div>
             ) : (
               <div className="flex-1 overflow-y-auto p-3 space-y-3 font-mono text-[10px]">
-                {/* Explicit 4-State Connection Honesty Matrix */}
-                <div className="p-2 bg-[#c88b32]/10 border border-[#c88b32]/40 space-y-1.5">
-                  <div className="text-[#c88b32] font-semibold">
-                    NO LIVE VIDEO FEEDS CONNECTED (METADATA &amp; CALCULATED FOV ESTIMATES ONLY)
+                {/* Gateway Connection & Stream Telemetry Summary */}
+                <div className="p-2 bg-[#12151b] border border-[#252b36] space-y-1.5">
+                  <div className="text-[#e8ecf1] font-semibold">
+                    BOUNDED RTSP CAMERA GATEWAY (MAX 4 / ORG · 1 FRAME / 5s)
+                  </div>
+                  <div className="flex gap-1">
+                    <input
+                      type="url"
+                      value={camGatewayUrl}
+                      onChange={(e) => setCamGatewayUrl(e.target.value)}
+                      placeholder="https://gateway.example:8443"
+                      className="flex-1 min-w-0 bg-[#0b0d10] border border-[#252b36] px-2 py-1 text-[10px] text-[#e8ecf1]"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void refreshGatewayCameraState()}
+                      className="px-2 py-1 bg-[#181c24] hover:bg-[#222834] border border-[#252b36] text-[#e8ecf1] cursor-pointer"
+                      title="Sync gateway stream statuses"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                    </button>
                   </div>
                   <div className="grid grid-cols-2 gap-1 text-[9px]">
                     <div className="px-1.5 py-1 bg-[#0b0d10] border border-[#252b36] text-[#e8ecf1]">
-                      REGISTERED:{' '}
+                      REGISTERED: <strong>{cameras.length}</strong>
+                    </div>
+                    <div className="px-1.5 py-1 bg-[#0b0d10] border border-[#252b36] text-[#4f8f66]">
+                      STREAMING:{' '}
                       <strong>
-                        {cameras.filter((c) => (c.connectionState || (c.endpointUrl ? 'configured' : 'registered')) === 'registered').length}
+                        {Object.values(gatewayCameras).filter((c) => c.status === 'streaming').length}
                       </strong>
-                    </div>
-                    <div className="px-1.5 py-1 bg-[#0b0d10] border border-[#252b36] text-[#4a9eb0]">
-                      CONFIGURED:{' '}
-                      <strong>
-                        {cameras.filter((c) => (c.connectionState || (c.endpointUrl ? 'configured' : 'registered')) === 'configured').length}
-                      </strong>
-                    </div>
-                    <div className="px-1.5 py-1 bg-[#0b0d10] border border-[#252b36] text-[#8c97a8]">
-                      CONNECTED: <strong>0</strong>
-                    </div>
-                    <div className="px-1.5 py-1 bg-[#0b0d10] border border-[#252b36] text-[#8c97a8]">
-                      OPERATIONAL: <strong>0</strong>
                     </div>
                   </div>
+                  {streamNotice && (
+                    <div className="p-1.5 bg-[#c88b32]/10 border border-[#c88b32]/40 text-[#c88b32] break-words">
+                      {streamNotice}
+                    </div>
+                  )}
                 </div>
 
-                <div className="space-y-1.5">
-                  <div className="tracking-[0.12em] text-[#8c97a8] font-semibold">
-                    SURVEILLANCE GATEWAY ADAPTERS
-                  </div>
-                  {CAMERA_GATEWAY_ADAPTERS.map((gw) => (
-                    <div key={gw.protocol} className="p-2 bg-[#12151b] border border-[#252b36] space-y-1">
-                      <div className="text-[#e8ecf1] font-semibold">{gw.label}</div>
-                      <div className="text-[#c88b32]">{gw.status}</div>
-                      <div className="text-[#8c97a8] font-sans leading-relaxed">{gw.requirement}</div>
+                {/* Live Camera Frame & Analytics Viewer (paired with map FOV overlay) */}
+                {activeViewerCamId && (() => {
+                  const activeCam = cameras.find((c) => c.id === activeViewerCamId);
+                  const activeGw = gatewayCameras[activeViewerCamId];
+                  const analytics = activeGw?.latestAnalytics;
+                  if (!activeCam) return null;
+                  return (
+                    <div className="p-2 bg-[#0b0d10] border border-[#4f8f66]/60 space-y-2">
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="text-[#4f8f66] font-semibold truncate">
+                          LIVE FEED · {activeCam.cameraCode}
+                        </span>
+                        <span className="px-1 py-0.5 bg-[#12151b] border border-[#252b36] text-[9px] text-[#e8ecf1]">
+                          {activeGw?.status?.toUpperCase() || 'POLLING'}
+                        </span>
+                      </div>
+
+                      {liveFrameObjectUrl ? (
+                        <div className="relative border border-[#252b36] bg-black">
+                          <img
+                            src={liveFrameObjectUrl}
+                            alt={`Live camera frame ${activeCam.cameraCode}`}
+                            className="w-full h-36 object-contain"
+                          />
+                          <div className="absolute bottom-1 left-1 px-1.5 py-0.5 bg-[#0b0d10]/85 border border-[#252b36] text-[9px] text-[#e8ecf1]">
+                            FOV {activeCam.fovDeg}° · Az {activeCam.bearingDeg}° · {activeCam.rangeMeters}m
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="h-24 border border-[#252b36] flex items-center justify-center text-[#8c97a8] text-center px-2">
+                          {activeGw?.status === 'offline'
+                            ? `CAMERA OFFLINE: ${activeGw.offlineReason || '3 consecutive decode failures'}`
+                            : 'Awaiting decoded JPEG frame (5s cadence)...'}
+                        </div>
+                      )}
+
+                      <div className="text-[9px] text-[#8c97a8] flex justify-between">
+                        <span>Retention: {activeCam.retentionSetting || 'none'}</span>
+                        <span>Last: {activeGw?.lastFrameAtUtc ? activeGw.lastFrameAtUtc.slice(11, 19) + 'Z' : '—'}</span>
+                      </div>
+
+                      {/* Biometric & Person Analytics Readout */}
+                      <div className="p-1.5 bg-[#12151b] border border-[#252b36] space-y-1 text-[9px]">
+                        {analytics ? (
+                          analytics.status === 'ANALYTICS_UNAVAILABLE' ? (
+                            <div className="text-[#c88b32]">
+                              VISION ANALYTICS UNAVAILABLE: {analytics.unavailableReason}
+                            </div>
+                          ) : (
+                            <>
+                              <div className="flex justify-between text-[#e8ecf1]">
+                                <span>FACES: <strong>{analytics.faceCount}</strong></span>
+                                <span>PERSONS: <strong>{analytics.personCount}</strong></span>
+                                <span>ALERTS: <strong className="text-[#c94a4a]">{analytics.alerts.length}</strong></span>
+                              </div>
+                              {analytics.persons.map((p, idx) => (
+                                <div key={`${p.trackId}-${idx}`} className="text-[#8c97a8]">
+                                  Track {p.trackId}: {p.personLabel || 'Unidentified'} ({Math.round(p.confidence * 100)}%)
+                                  {p.crossCameraSeenIn && p.crossCameraSeenIn.length > 1
+                                    ? ` · Seen across: ${p.crossCameraSeenIn.join(' -> ')}`
+                                    : ''}
+                                </div>
+                              ))}
+                              {analytics.alerts.map((al) => (
+                                <div key={al.alertId} className="p-1 bg-[#c94a4a]/15 border border-[#c94a4a]/40 text-[#e8ecf1]">
+                                  ALERT: {al.reason}
+                                </div>
+                              ))}
+                            </>
+                          )
+                        ) : (
+                          <div className="text-[#8c97a8]">Analytics pending decoded frame.</div>
+                        )}
+                      </div>
                     </div>
-                  ))}
-                </div>
+                  );
+                })()}
 
                 <form onSubmit={handleAddCamera} className="border-t border-[#252b36] pt-3 space-y-1.5">
                   <div className="tracking-[0.12em] text-[#8c97a8] font-semibold">
-                    REGISTER CAMERA METADATA &amp; FOV ESTIMATE
+                    REGISTER CAMERA &amp; RTSP GATEWAY STREAM
                   </div>
                   {camError && (
                     <div className="p-1.5 bg-[#c94a4a]/10 border border-[#c94a4a]/40 text-[#c94a4a]">
@@ -802,6 +1098,26 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
                     placeholder="Gate / Perimeter Label"
                     className="w-full bg-[#0b0d10] border border-[#252b36] px-2 py-1 text-[#e8ecf1]"
                   />
+                  <select
+                    value={camSiteId}
+                    onChange={(e) => {
+                      const id = e.target.value;
+                      setCamSiteId(id);
+                      const coord = id ? intel.assetCoordsMap.get(id) : null;
+                      if (coord) {
+                        setCamLng(coord[0].toFixed(5));
+                        setCamLat(coord[1].toFixed(5));
+                      }
+                    }}
+                    className="w-full bg-[#0b0d10] border border-[#252b36] px-2 py-1 text-[#e8ecf1]"
+                  >
+                    <option value="">Covered Site (optional)</option>
+                    {intel.assets.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.site_code} · {a.name}
+                      </option>
+                    ))}
+                  </select>
                   <div className="grid grid-cols-2 gap-1.5">
                     <input
                       type="number"
@@ -847,18 +1163,51 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
                     />
                   </div>
                   <input
-                    type="url"
+                    type="password"
+                    autoComplete="off"
                     value={camUrl}
                     onChange={(e) => setCamUrl(e.target.value)}
-                    placeholder="Optional https://...m3u8 endpoint"
+                    placeholder="rtsp://... or https://... stream URL (never exposed)"
                     className="w-full bg-[#0b0d10] border border-[#252b36] px-2 py-1 text-[#e8ecf1]"
                   />
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <select
+                      value={camRetention}
+                      onChange={(e) => setCamRetention(e.target.value as CameraRetentionSetting)}
+                      title="Disk frame retention (default none)"
+                      className="bg-[#0b0d10] border border-[#252b36] px-1.5 py-1 text-[#e8ecf1]"
+                    >
+                      <option value="none">Retention: none</option>
+                      <option value="1h">Retention: 1h</option>
+                      <option value="24h">Retention: 24h</option>
+                      <option value="7d">Retention: 7d</option>
+                      <option value="30d">Retention: 30d</option>
+                    </select>
+                    <input
+                      type="text"
+                      value={camLegalBasisRef}
+                      onChange={(e) => setCamLegalBasisRef(e.target.value)}
+                      placeholder="Legal basis ref (DPIA-...)"
+                      className="bg-[#0b0d10] border border-[#252b36] px-2 py-1 text-[#e8ecf1]"
+                    />
+                  </div>
+                  {isAdmin && (
+                    <label className="flex items-center gap-1.5 px-1 py-0.5 text-[9px] text-[#c88b32] cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={camAdminOverride}
+                        onChange={(e) => setCamAdminOverride(e.target.checked)}
+                        className="accent-[#c88b32]"
+                      />
+                      <span>Admin: explicitly accept activating without legal_basis_ref</span>
+                    </label>
+                  )}
                   <button
                     type="submit"
                     className="w-full py-1 bg-[#6f8054] hover:bg-[#7d905f] text-[#0b0d10] font-semibold flex items-center justify-center gap-1 cursor-pointer"
                   >
                     <Plus className="w-3 h-3" />
-                    <span>Register Camera Footprint</span>
+                    <span>Register Camera</span>
                   </button>
                 </form>
 
@@ -866,13 +1215,19 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
                   <div className="border-t border-[#252b36] pt-2 space-y-1.5">
                     <div className="text-[#8c97a8] font-semibold">REGISTERED CAMERAS ({cameras.length})</div>
                     {cameras.map((cam) => {
-                      const state = cam.connectionState || (cam.endpointUrl ? 'configured' : 'registered');
+                      const gwCam = gatewayCameras[cam.id];
+                      const state = gwCam?.status || cam.connectionState || 'registered';
+                      const isStreaming = gwCam?.status === 'streaming';
+                      const busy = streamBusyId === cam.id;
                       return (
-                        <div key={cam.id} className="p-2 bg-[#12151b] border border-[#252b36] space-y-1">
+                        <div key={cam.id} className="p-2 bg-[#12151b] border border-[#252b36] space-y-1.5">
                           <div className="flex items-center justify-between gap-1">
                             <button
                               type="button"
-                              onClick={() => setCenterTarget([cam.lng, cam.lat])}
+                              onClick={() => {
+                                setCenterTarget([cam.lng, cam.lat]);
+                                setActiveViewerCamId(cam.id);
+                              }}
                               className="text-[#4a9eb0] font-semibold hover:underline truncate cursor-pointer"
                             >
                               {cam.cameraCode} · {cam.name}
@@ -886,19 +1241,81 @@ export const GeointWorkspace: React.FC<GeointWorkspaceProps> = ({
                               <Trash2 className="w-3 h-3" />
                             </button>
                           </div>
-                          <div className="text-[#8c97a8] tabular-nums">
-                            Est. Coverage: {cam.protocol} · Az {cam.bearingDeg}° · FOV {cam.fovDeg}° · {cam.rangeMeters}m
+                          <div className="text-[#8c97a8] tabular-nums text-[9px]">
+                            {cam.siteCode ? `Site: ${cam.siteCode} · ` : ''}
+                            Ret: {cam.retentionSetting || 'none'} · Az {cam.bearingDeg}° · FOV {cam.fovDeg}° · {cam.rangeMeters}m
                           </div>
+                          {!transientStreamUrls[cam.id] && !cam.endpointUrl && !isStreaming && (
+                            <input
+                              type="password"
+                              autoComplete="off"
+                              value={transientStreamUrls[cam.id] || ''}
+                              onChange={(e) =>
+                                setTransientStreamUrls((prev) => ({ ...prev, [cam.id]: e.target.value }))
+                              }
+                              placeholder="Enter RTSP URL for gateway start..."
+                              className="w-full bg-[#0b0d10] border border-[#252b36] px-1.5 py-0.5 text-[9px] text-[#e8ecf1]"
+                            />
+                          )}
                           <div className="flex items-center justify-between gap-1">
-                            <span className="px-1 py-0.5 bg-[#0b0d10] border border-[#252b36] text-[9px] text-[#c88b32]">
-                              STATE: {state.toUpperCase()} (NOT OPERATIONAL)
+                            <span
+                              className={`px-1 py-0.5 bg-[#0b0d10] border border-[#252b36] text-[9px] ${
+                                state === 'streaming' || state === 'operational'
+                                  ? 'text-[#4f8f66]'
+                                  : state === 'offline'
+                                  ? 'text-[#c94a4a]'
+                                  : 'text-[#c88b32]'
+                              }`}
+                            >
+                              {state.toUpperCase()}
                             </span>
+                            <div className="flex items-center gap-1">
+                              {isStreaming ? (
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => void handleStopGatewayStream(cam)}
+                                  className="px-1.5 py-0.5 bg-[#c94a4a]/20 border border-[#c94a4a]/50 text-[#e8ecf1] flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                >
+                                  <Square className="w-2.5 h-2.5" />
+                                  <span>Stop</span>
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => void handleStartGatewayStream(cam)}
+                                  className="px-1.5 py-0.5 bg-[#4f8f66]/20 border border-[#4f8f66]/50 text-[#e8ecf1] flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                >
+                                  <Play className="w-2.5 h-2.5" />
+                                  <span>{busy ? 'Starting...' : 'Connect'}</span>
+                                </button>
+                              )}
+                            </div>
                           </div>
+                          {(gwCam?.offlineReason || cam.lastStreamError) && (
+                            <div className="text-[9px] text-[#c94a4a] break-words">
+                              Offline: {gwCam?.offlineReason || cam.lastStreamError}
+                            </div>
+                          )}
                         </div>
                       );
                     })}
                   </div>
                 )}
+
+                <div className="space-y-1.5 border-t border-[#252b36] pt-2">
+                  <div className="tracking-[0.12em] text-[#8c97a8] font-semibold">
+                    SURVEILLANCE GATEWAY ADAPTERS
+                  </div>
+                  {CAMERA_GATEWAY_ADAPTERS.map((gw) => (
+                    <div key={gw.protocol} className="p-2 bg-[#12151b] border border-[#252b36] space-y-1">
+                      <div className="text-[#e8ecf1] font-semibold">{gw.label}</div>
+                      <div className="text-[#8fa36d]">{gw.status}</div>
+                      <div className="text-[#8c97a8] font-sans leading-relaxed">{gw.requirement}</div>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </aside>

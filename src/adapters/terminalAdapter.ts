@@ -693,10 +693,12 @@ export function executeDefensiveTerminalCommand(
       ];
       CTI_ADAPTER_CATALOG.forEach((adp) => {
         const count = externalIndicators.filter((i) => i.providerId === adp.id).length;
-        const statusLabel = adp.requiresServerProxy ? 'DEFERRED — PHASE 2' : adp.status.toUpperCase();
+        const statusLabel = adp.requiresServerProxy
+          ? `GATEWAY PROXY (${adp.proxyEndpoint || '/api/v1/cti/indicators'})`
+          : adp.status.toUpperCase();
         lines.push({
           text: `  • ${adp.id} [${statusLabel}] — ${count} staged record(s)`,
-          tone: adp.status === 'local_bundle_ready' ? 'ok' : 'muted',
+          tone: adp.status === 'local_bundle_ready' ? 'ok' : 'normal',
         });
       });
       return finish('CTI STATUS', lines);
@@ -726,14 +728,15 @@ export function executeDefensiveTerminalCommand(
           { text: `Unknown CTI provider "${thirdArg}". Available: ${CTI_ADAPTER_CATALOG.map((a) => a.id).join(', ')}`, tone: 'warn' },
         ]);
       }
-      const statusLabel = adp.requiresServerProxy ? 'DEFERRED — PHASE 2' : adp.status.toUpperCase();
+      const statusLabel = adp.requiresServerProxy ? 'GATEWAY PROXY' : adp.status.toUpperCase();
       const lines: TerminalOutputLine[] = [
         { text: `PROVIDER ${adp.name} (${adp.id}) — STATUS: ${statusLabel}`, tone: 'accent' },
-        { text: `  Staged Local Indicators: ${hits.length} | Proxy Required: ${adp.requiresServerProxy ? 'YES' : 'NO'}`, tone: 'normal' },
+        {
+          text: `  Staged Local Indicators: ${hits.length} | Proxy Required: ${adp.requiresServerProxy ? adp.proxyEndpoint || 'YES' : 'NO'}`,
+          tone: 'normal',
+        },
+        { text: `  Requirements: ${adp.credentialRequirement}`, tone: 'muted' },
       ];
-      if (adp.deferredExplanation) {
-        lines.push({ text: `  Note: ${adp.deferredExplanation}`, tone: 'muted' });
-      }
       hits.slice(0, 12).forEach((i) => {
         lines.push({
           text: `  • ${i.value} (${i.indicatorType}, ${i.verificationStatus}${i.isExpired ? ', EXPIRED' : ''})`,

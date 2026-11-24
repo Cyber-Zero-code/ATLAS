@@ -25,7 +25,7 @@ import {
   validateGatewayEndpointUrl,
   checkGatewayHealth,
 } from '../adapters/gatewayClient';
-import { parseCtiJsonBundle } from '../adapters/ctiAdapters';
+import { CTI_ADAPTER_CATALOG, mapProxyIndicatorsToExternal, parseCtiJsonBundle } from '../adapters/ctiAdapters';
 import {
   validateAuthorisedEndpointUrl,
   buildCamerasGeoJson,
@@ -560,6 +560,50 @@ const kevBundle = JSON.stringify({
 });
 const kevReport = parseCtiJsonBundle(kevBundle, 'CISA_KEV', ORG_ID, sampleAssets, sampleIncidents);
 check('CISA KEV parser extracts CVE records accurately', kevReport.indicators.length === 1 && kevReport.indicators[0].indicatorType === 'cve' && kevReport.indicators[0].value === 'CVE-2026-9999');
+
+const proxyAdapters = CTI_ADAPTER_CATALOG.filter((a) => a.requiresServerProxy);
+check(
+  'all four proxy CTI adapters point to /api/v1/cti/indicators without deferred markers',
+  proxyAdapters.length === 4 &&
+    proxyAdapters.every((a) => a.proxyEndpoint === '/api/v1/cti/indicators' && (a.status as string) !== 'deferred_phase_2')
+);
+
+const proxyMapped = mapProxyIndicatorsToExternal(
+  [
+    {
+      type: 'ip',
+      value: '198.51.100.10',
+      source: 'ALIENVAULT_OTX',
+      source_ref: 'otx:pulse:1:ind1',
+      first_seen: '2026-11-10T00:00:00Z',
+      last_seen: null,
+      confidence: 70,
+      tags: ['scanner'],
+    },
+    {
+      type: 'url',
+      value: 'https://sub01.grid.internal/payload.bin',
+      source: 'ABUSE_CH',
+      source_ref: 'urlhaus:55',
+      first_seen: '2026-11-11T00:00:00Z',
+      last_seen: null,
+      confidence: 80,
+      tags: ['loader'],
+    },
+  ],
+  ORG_ID,
+  sampleAssets,
+  sampleIncidents,
+  stixReport.indicators
+);
+check(
+  'mapProxyIndicatorsToExternal deduplicates against existing cache and correlates assets with isExternalIntel=true',
+  proxyMapped.skippedDuplicates === 1 &&
+    proxyMapped.indicators.length === 1 &&
+    proxyMapped.indicators[0].isExternalIntel === true &&
+    proxyMapped.indicators[0].verificationStatus === 'unverified' &&
+    proxyMapped.indicators[0].matchedAssetIds.includes('a1')
+);
 
 // ---------------- Module E: Computational Geospatial Analysis ----------------
 console.log('Module E: Computational Geospatial Analysis');

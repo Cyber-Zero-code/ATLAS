@@ -1,0 +1,28 @@
+[Unit]
+Description=Project ATLAS Linux Security Execution Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=atlas-gateway
+Group=atlas-gateway
+WorkingDirectory=/opt/atlas/gateway
+EnvironmentFile=/etc/atlas-gateway/env
+ExecStart=/usr/bin/node /opt/atlas/gateway/dist/src/server.js
+Restart=on-failure
+RestartSec=5
+
+# Systemd filesystem and privilege hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/atlas-gateway
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=atlas-gateway
+
+[Install]
+WantedBy=multi-user.target

@@ -42,6 +42,7 @@ export interface ResolvedToolPaths {
   nmap: string | null;
   tshark: string | null;
   python3: string | null;
+  ffmpeg?: string | null;
 }
 
 export async function runRealToolHealthChecks(): Promise<{
@@ -51,11 +52,12 @@ export async function runRealToolHealthChecks(): Promise<{
 }> {
   const checkedAtUtc = new Date().toISOString();
 
-  const [nmapProbe, tsharkProbe, pyProbe, unameProbe, wiresharkProbe, zeekProbe, suricataProbe, osqueryProbe, yaraProbe] =
+  const [nmapProbe, tsharkProbe, pyProbe, ffmpegProbe, unameProbe, wiresharkProbe, zeekProbe, suricataProbe, osqueryProbe, yaraProbe] =
     await Promise.all([
       probeBinary(['/usr/bin/nmap', 'nmap'], ['--version']),
       probeBinary(['/usr/bin/tshark', 'tshark'], ['--version']),
       probeBinary(['/usr/bin/python3', 'python3'], ['--version']),
+      probeBinary(['/usr/bin/ffmpeg', 'ffmpeg'], ['-version']),
       probeBinary(['/bin/uname', '/usr/bin/uname', 'uname'], ['-a']),
       probeBinary(['/usr/bin/dumpcap', '/usr/bin/wireshark', 'dumpcap'], ['--version']),
       probeBinary(['/usr/local/zeek/bin/zeek', '/usr/bin/zeek', 'zeek'], ['--version']),
@@ -180,6 +182,7 @@ export async function runRealToolHealthChecks(): Promise<{
       nmap: nmapProbe.binPath,
       tshark: tsharkProbe.binPath,
       python3: pyProbe.binPath,
+      ffmpeg: ffmpegProbe.binPath,
     },
     checkedAtUtc,
   };

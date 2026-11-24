@@ -39,7 +39,7 @@ Critical physical infrastructure (e.g., electrical transmission substations, wat
 * **Mitigation**:
   1. **Accuracy Classes (`exact_survey`, `facility_approximate`, `regional_approximate`)**: ATLAS requires declaring location precision on ingest.
   2. **Accuracy Halos on Vector Map**: Regional and approximate assets are rendered with generalized accuracy halos rather than pinpoint markers.
-  3. **Strict Zero-Tile / No Third-Party Leakage**: MapLibre renders from internal GeoJSON and vector sources. No external tile servers or basemap APIs receive queries containing map bounding boxes or coordinates.
+  3. **Gateway-Proxied Basemap Tiles / Zero Direct Browser Requests**: MapLibre renders from a neutral/blank offline canvas plus internal GeoJSON/vector sources by default. Public raster or vector tile servers are permitted only when routed through the authenticated `gateway/` tile proxy (which sends viewport `z`/`x`/`y` only, caches responses, strips client IPs/user IDs, and forbids asset/incident metadata); the client browser never contacts external tile servers directly.
   4. **Workspace Segregation**: Only authenticated users with verified AAL2 MFA belonging to that exact organisation can execute GeoJSON queries.
 
 ### Abuse Case 3.2: Site Code Enumeration & De-anonymisation
@@ -54,6 +54,15 @@ Critical physical infrastructure (e.g., electrical transmission substations, wat
 * **Mitigation**:
   1. **Database Composite Foreign Keys**: Dependency edges enforce `(org_id, from_asset_id)` and `(org_id, to_asset_id)`. Creating an edge between assets of different organisations is rejected by PostgreSQL foreign key validation (`SQLSTATE 23503`).
   2. **Independent Blast Radius Execution**: `blast_radius(incident_id)` filters edge traversals strictly within `v_org_id`, making cross-tenant impact calculation impossible.
+
+### Abuse Case 3.4: Location Leakage via Tile Requests
+* **Threat**: Fetching public raster or vector basemap tiles reveals the geographic region and zoom level an analyst is inspecting to external tile providers, CDNs, or network observers; combined with operator IP addresses, user identifiers, or unfiltered query parameters, external providers could correlate tenant identity with sensitive infrastructure locations.
+* **Mitigation (Approved Rules)**:
+  1. **Viewport `z`/`x`/`y` Only**: Tile requests carry strictly the `z`/`x`/`y` coordinates of the visible viewport and never include asset coordinates, site codes, incident identifiers, or any value derived from a sensitive asset.
+  2. **No Direct Client Requests**: The browser never contacts external tile providers directly; every tile request passes through the `gateway/` tile proxy after existing JWT, AAL2, and workspace membership checks.
+  3. **Server-Side Caching & Header Stripping**: The `gateway/` tile proxy caches fetched tiles and strips client IP addresses, user identifiers, and authorisation headers before querying an upstream tile provider.
+  4. **Existing Precision Controls Preserved**: Sensitive-location controls in Section 3 remain in full force—accuracy classes, accuracy halos, and approximate labels remain unchanged.
+* **Residual Risk Accepted by Developer**: Even with cached viewport `z`/`x`/`y` proxying and stripped client identifiers, upstream cache-miss fetches still disclose coarse tile indices (region and zoom level) at the gateway's egress IP to the chosen tile provider. The developer explicitly accepts this coarse viewport exposure in exchange for situational basemap context over a blank canvas, provided all four mitigations above are enforced.
 
 ---
 

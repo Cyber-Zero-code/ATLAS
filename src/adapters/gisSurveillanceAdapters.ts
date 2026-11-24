@@ -10,9 +10,13 @@
  *   or unconfigured cameras NEVER show fabricated video streams.
  */
 
+import { supabase } from '../lib/supabase';
+import { validateGatewayEndpointUrl } from './gatewayClient';
 import type {
   CameraRegistryItem,
+  CameraRetentionSetting,
   GisAdapterCatalogEntry,
+  GatewayCameraRecord,
 } from '../types/atlas';
 
 export const GIS_SOURCE_ADAPTER_CATALOG: GisAdapterCatalogEntry[] = [
@@ -71,27 +75,26 @@ export const GIS_SOURCE_ADAPTER_CATALOG: GisAdapterCatalogEntry[] = [
 export const CAMERA_GATEWAY_ADAPTERS = [
   {
     protocol: 'ONVIF' as const,
-    label: 'ONVIF Profile S / Profile T Metadata & PTZ Adapter',
-    status: 'AWAITING AUTHORISED PROXY',
-    requirement: 'Requires on-prem ONVIF WS-Security gateway bridge (browser cannot open raw TCP/SOAP ONVIF sockets without TLS bridge).',
+    label: 'ONVIF Profile S / Profile T Gateway Decoder',
+    status: 'BOUNDED GATEWAY DECODER (1 FRAME / 5s)',
+    requirement: 'Decoded server-side via gateway ffmpeg child process; JPEG frames fetched with AAL2 JWT.',
   },
   {
     protocol: 'RTSP_WEBRTC' as const,
-    label: 'RTSP -> WebRTC Low-Latency Gateway (MediaMTX / Janus)',
-    status: 'AWAITING AUTHORISED GATEWAY',
-    requirement: 'Requires WHEP/WebRTC HTTPS signalling endpoint on internal/VPN network.',
+    label: 'RTSP / RTSPS Live Gateway Decoder',
+    status: 'BOUNDED GATEWAY DECODER (1 FRAME / 5s)',
+    requirement: 'Stream URL & credentials held strictly server-side; max 4 concurrent streams per org.',
   },
   {
     protocol: 'RTSP_HLS' as const,
-    label: 'RTSP -> HLS (`.m3u8`) Segmented Stream Gateway',
-    status: 'READY WHEN ENDPOINT SUPPLIED',
-    requirement: 'Requires HTTPS CORS-enabled `.m3u8` stream URL from authorised VMS relay.',
+    label: 'RTSP / HTTPS -> Gateway JPEG Stream Adapter',
+    status: 'READY VIA AUTHENTICATED GATEWAY',
+    requirement: 'Requires running gateway service + camera legal_basis_ref (or atlas:admin override).',
   },
 ];
 
 /**
- * Validates user-supplied GIS or Camera Gateway endpoints
- * (`https://` required, zero embedded `user:pass@` credentials).
+ * Validates browser-direct GIS endpoints (`https://` required, zero embedded `user:pass@` credentials).
  */
 export function validateAuthorisedEndpointUrl(rawUrl: string): { valid: boolean; reason?: string } {
   const trimmed = rawUrl.trim();
@@ -120,6 +123,186 @@ export function validateAuthorisedEndpointUrl(rawUrl: string): { valid: boolean;
     return { valid: false, reason: 'Malformed URL format.' };
   }
   return { valid: true };
+}
+
+/**
+ * Validates registered camera stream URLs destined for server-side decoding in the gateway.
+ * Permits `rtsp://`, `rtsps://`, and `https://`. Credentials are never persisted in browser state/DB.
+ */
+export function validateCameraStreamUrlForGateway(rawUrl: string): { valid: boolean; reason?: string } {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed || /\s/.test(trimmed)) {
+    return { valid: false, reason: 'Camera stream URL must be non-empty without whitespace.' };
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (!['rtsp:', 'rtsps:', 'https:'].includes(parsed.protocol)) {
+      return { valid: false, reason: 'Camera stream URL must start with rtsp://, rtsps://, or https://.' };
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (!host || host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '169.254.169.254') {
+      return { valid: false, reason: 'Loopback and cloud metadata camera targets are blocked by gateway policy.' };
+    }
+    return { valid: true };
+  } catch {
+    return { valid: false, reason: 'Malformed camera stream URL.' };
+  }
+}
+
+async function getActiveSessionJwt(): Promise<string> {
+  const { data } = await supabase.auth.getSession();
+  const token = data?.session?.access_token;
+  if (!token) {
+    throw new Error('No active authenticated Supabase session found.');
+  }
+  return token;
+}
+
+export async function listGatewayCameras(
+  gatewayUrl: string,
+  orgId: string
+): Promise<{ cameras: GatewayCameraRecord[]; maxConcurrentPerOrg: number }> {
+  const gw = validateGatewayEndpointUrl(gatewayUrl);
+  if (!gw.valid || !gw.normalized) {
+    throw new Error(gw.reason || 'Invalid gateway URL.');
+  }
+  const jwt = await getActiveSessionJwt();
+  const res = await fetch(`${gw.normalized}/api/v1/cameras`, {
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      'x-atlas-org-id': orgId,
+      Accept: 'application/json',
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error || `Failed to load gateway cameras (HTTP ${res.status}).`);
+  }
+  return {
+    cameras: Array.isArray(data?.cameras) ? (data.cameras as GatewayCameraRecord[]) : [],
+    maxConcurrentPerOrg: Number(data?.maxConcurrentPerOrg || 4),
+  };
+}
+
+export async function registerAndStartGatewayCamera(params: {
+  gatewayUrl: string;
+  orgId: string;
+  camera: CameraRegistryItem;
+  streamUrl: string;
+  retentionSetting?: CameraRetentionSetting;
+  adminAcceptWithoutLegalBasis?: boolean;
+}): Promise<GatewayCameraRecord> {
+  const gw = validateGatewayEndpointUrl(params.gatewayUrl);
+  if (!gw.valid || !gw.normalized) {
+    throw new Error(gw.reason || 'Invalid gateway URL.');
+  }
+  const urlCheck = validateCameraStreamUrlForGateway(params.streamUrl);
+  if (!urlCheck.valid) {
+    throw new Error(urlCheck.reason || 'Invalid camera stream URL.');
+  }
+  const jwt = await getActiveSessionJwt();
+  const res = await fetch(`${gw.normalized}/api/v1/cameras`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      'x-atlas-org-id': params.orgId,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      cameraId: params.camera.id,
+      siteId: params.camera.siteId,
+      siteCode: params.camera.siteCode,
+      cameraCode: params.camera.cameraCode,
+      name: params.camera.name,
+      protocol: params.camera.protocol,
+      streamUrl: params.streamUrl.trim(),
+      retentionSetting: params.retentionSetting || params.camera.retentionSetting || 'none',
+      legalBasisRef: params.camera.legalBasisRef,
+      adminAcceptWithoutLegalBasis: Boolean(params.adminAcceptWithoutLegalBasis),
+      autoStart: true,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.camera) {
+    throw new Error(data?.error || `Gateway refused camera stream start (HTTP ${res.status}).`);
+  }
+  return data.camera as GatewayCameraRecord;
+}
+
+export async function stopGatewayCamera(params: {
+  gatewayUrl: string;
+  orgId: string;
+  cameraId: string;
+}): Promise<GatewayCameraRecord> {
+  const gw = validateGatewayEndpointUrl(params.gatewayUrl);
+  if (!gw.valid || !gw.normalized) {
+    throw new Error(gw.reason || 'Invalid gateway URL.');
+  }
+  const jwt = await getActiveSessionJwt();
+  const res = await fetch(`${gw.normalized}/api/v1/cameras/${encodeURIComponent(params.cameraId)}/stop`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      'x-atlas-org-id': params.orgId,
+      Accept: 'application/json',
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.camera) {
+    throw new Error(data?.error || `Failed to stop camera stream (HTTP ${res.status}).`);
+  }
+  return data.camera as GatewayCameraRecord;
+}
+
+export async function fetchGatewayCameraFrameBlob(params: {
+  gatewayUrl: string;
+  orgId: string;
+  cameraId: string;
+}): Promise<Blob> {
+  const gw = validateGatewayEndpointUrl(params.gatewayUrl);
+  if (!gw.valid || !gw.normalized) {
+    throw new Error(gw.reason || 'Invalid gateway URL.');
+  }
+  const jwt = await getActiveSessionJwt();
+  const res = await fetch(`${gw.normalized}/api/v1/cameras/${encodeURIComponent(params.cameraId)}/frame`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      'x-atlas-org-id': params.orgId,
+      Accept: 'image/jpeg',
+    },
+  });
+  if (!res.ok) {
+    const errJson = await res.json().catch(() => ({}));
+    throw new Error(errJson?.error || `Camera frame unavailable (HTTP ${res.status}).`);
+  }
+  return res.blob();
+}
+
+export async function fetchGatewayCameraAnalytics(params: {
+  gatewayUrl: string;
+  orgId: string;
+  cameraId: string;
+}): Promise<GatewayCameraRecord> {
+  const gw = validateGatewayEndpointUrl(params.gatewayUrl);
+  if (!gw.valid || !gw.normalized) {
+    throw new Error(gw.reason || 'Invalid gateway URL.');
+  }
+  const jwt = await getActiveSessionJwt();
+  const res = await fetch(`${gw.normalized}/api/v1/cameras/${encodeURIComponent(params.cameraId)}/analytics`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      'x-atlas-org-id': params.orgId,
+      Accept: 'application/json',
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.camera) {
+    throw new Error(data?.error || `Failed to fetch camera analytics (HTTP ${res.status}).`);
+  }
+  return data.camera as GatewayCameraRecord;
 }
 
 /**

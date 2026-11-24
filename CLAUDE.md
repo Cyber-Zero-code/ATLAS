@@ -16,13 +16,18 @@ This file holds the rules that apply to every session. Read it first, every time
 - **Beachhead (H1):** private security service firms (MSSPs, IR and OT/resilience consultancies). Government is a later destination via these partners. Add no government-specific features, accreditation claims, or classified-network language.
 - **Tenancy:** shared PostgreSQL with row-level security. The same image must be able to run single-tenant later.
 - **Identity:** Supabase Auth with MFA. Never build authentication.
-- **Basemap:** neutral/blank style plus our own vector layers. No public tile servers. Licence decision deferred to pre-pilot.
+- **Basemap:** neutral/blank style plus our own vector layers by default; public raster or vector tile servers are permitted, requested only through the gateway's tile proxy (added in a later commit), subject to these rules:
+  - Tile requests carry only the `z`/`x`/`y` tile coordinates of the visible viewport. They never contain asset coordinates, site codes, incident identifiers, or any value derived from a sensitive asset.
+  - The client never contacts the tile provider directly. All tile requests go through the gateway.
+  - The proxy caches tiles and does not forward client IP addresses or user identifiers to the provider.
+  - Sensitive-location controls in `docs/threat-model.md` Section 3 remain in force. Accuracy halos and approximate labels are unchanged.
+  - Licence decision deferred to pre-pilot.
 - **Licence:** proprietary.
 - **Data:** synthetic only. No real customer data, no real critical-site coordinates, until counsel has cleared the India items and a partner has authorised data. Use fictional locations in all fixtures.
 
 ## Architecture (fixed)
-Platform: Google AI Studio (React + Vite + TypeScript) for the front end, Supabase for the backend. No custom server.
-- Map: MapLibre GL JS, neutral/blank style, our own vector layers. No public tile servers.
+Platform: Google AI Studio (React + Vite + TypeScript) for the front end, Supabase for the backend. A custom server is permitted only for the Linux execution gateway, the CTI proxy, the tile proxy, and bounded registered-camera stream decoding/analytics, all in `gateway/`. Each must authenticate every request with the existing JWT, AAL2, and membership checks. Browser code still holds only the public anon key.
+- Map: MapLibre GL JS, neutral/blank style plus our own vector layers; public raster or vector tile servers are permitted only through the `gateway/` tile proxy under the Basemap rules above.
 - Database: Supabase Postgres + PostGIS. Tenancy enforced by row-level security on every table, plus checks in code.
 - Auth: Supabase Auth with MFA. Never build authentication.
 - Files and evidence: Supabase Storage.
@@ -42,7 +47,7 @@ Build, in this order, finishing each before starting the next:
 
 **Do not build, stub, or scaffold (ask first if a task seems to need one):**
 - Deferred to Phase 2: saved map views, GeoPackage import, single-tenant packaging test, observability beyond correlation IDs, role-based coordinate generalisation (design and document it, do not build it).
-- Deferred stack and formats: GeoServer, Kafka, PyTorch, QGIS as a component; Shapefile, KML, GeoTIFF, 3D.
+- Deferred stack and formats: GeoServer, Kafka, QGIS as a component; Shapefile, KML, GeoTIFF, 3D. (ML/inference runtimes and Python/ONNX vision workers for authorised camera stream analytics are permitted in `gateway/`.)
 - Later features: correlation/clustering, copilot, what-if scenarios, SIEM and STIX/TAXII ingest, any LLM calls.
 - Custom authentication; separate "security", "admin", or "reports" modules.
 - UI polish beyond what the slice needs to function.
@@ -77,8 +82,8 @@ If you see a way to finish sooner by cutting scope, propose it. Never cut priori
 ## Claims and language
 - Never use "forensic", "defence-grade", or "predictive" in code, docs, UI, or marketing. Use "evidence management".
 - Never claim certification, accreditation, or classified-network suitability.
-- Outputs are review signals with uncertainty. Never attribute activity to a person or an actor.
-- ATLAS does no targeting or attack planning, no covert tracking of individuals, and no unauthorised collection.
+- Outputs are review signals with uncertainty. Never attribute cyber threat activity to a person or an actor outside authorised site camera biometric/person-tracking workflows governed by `docs/decisions.md` (ADR 010 Amended).
+- ATLAS does no offensive targeting or attack planning and no unauthorised collection. Face detection/recognition, biometric processing, person detection/counting, cross-camera tracking, and person-identifying alerts are permitted strictly for an organisation's own registered site cameras under `docs/decisions.md` (ADR 010 Amended); third-party public camera feeds remain prohibited.
 
 ## CyberShield X (CSX) interface
 - CSX is design partner zero, but the only coupling is a versioned contract. ATLAS must run without CSX.

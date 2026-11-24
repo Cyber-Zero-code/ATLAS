@@ -1314,8 +1314,26 @@ export class AtlasDatabaseService {
   }
 
   // --------------------------------------------------------------------
-  // Camera registry (migration 018) - metadata only, never live video
+  // Camera registry (migrations 018 + 019) - gateway stream URLs NEVER expose credentials
   // --------------------------------------------------------------------
+
+  private sanitizeCameraUrlForDb(rawUrl?: string): string | null {
+    if (!rawUrl || !rawUrl.trim()) return null;
+    try {
+      const parsed = new URL(rawUrl.trim());
+      if (!['https:', 'http:', 'rtsp:', 'rtsps:'].includes(parsed.protocol)) {
+        return null;
+      }
+      // Strip embedded username/password & query credentials so DB rows never hold secrets
+      parsed.username = '';
+      parsed.password = '';
+      parsed.search = '';
+      parsed.hash = '';
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  }
 
   private mapCameraRow(row: any): CameraRegistryItem {
     return {
@@ -1328,14 +1346,20 @@ export class AtlasDatabaseService {
       bearingDeg: row.bearing_deg,
       fovDeg: row.fov_deg,
       rangeMeters: row.range_meters,
+      siteId: row.site_id ?? undefined,
+      siteCode: row.site_code ?? undefined,
+      retentionSetting: row.retention_setting || 'none',
+      legalBasisRef: row.legal_basis_ref ?? undefined,
+      adminAcceptedWithoutLegalBasis: Boolean(row.admin_no_legal_basis_accepted),
       connectionState: row.connection_state,
       streamStatus: row.stream_status,
       endpointUrl: row.endpoint_url ?? undefined,
+      lastStreamError: row.last_stream_error ?? undefined,
     };
   }
 
   /**
-   * Read the organisation's registered cameras (metadata only). Members only; MFA required.
+   * Read the organisation's registered cameras. Members only; MFA required.
    */
   async fetchCameras(orgId: string): Promise<CameraRegistryItem[]> {
     if (!this.isConfigured()) {
@@ -1352,6 +1376,7 @@ export class AtlasDatabaseService {
 
   /**
    * Register a camera. Any member may register one (same as recording evidence); audited by the database.
+   * Strips any embedded stream credentials before storing metadata.
    */
   async insertCamera(orgId: string, camera: Omit<CameraRegistryItem, 'id'>): Promise<CameraRegistryItem> {
     if (!this.isConfigured()) {
@@ -1363,6 +1388,8 @@ export class AtlasDatabaseService {
       .from('camera_registry')
       .insert({
         org_id: orgId,
+        site_id: camera.siteId || null,
+        site_code: camera.siteCode || null,
         camera_code: camera.cameraCode,
         name: camera.name,
         protocol: camera.protocol,
@@ -1371,9 +1398,13 @@ export class AtlasDatabaseService {
         bearing_deg: camera.bearingDeg,
         fov_deg: camera.fovDeg,
         range_meters: camera.rangeMeters,
+        retention_setting: camera.retentionSetting || 'none',
+        legal_basis_ref: camera.legalBasisRef?.trim() || null,
+        admin_no_legal_basis_accepted: Boolean(camera.adminAcceptedWithoutLegalBasis),
         connection_state: camera.connectionState || 'registered',
         stream_status: camera.streamStatus,
-        endpoint_url: camera.endpointUrl || null,
+        endpoint_url: this.sanitizeCameraUrlForDb(camera.endpointUrl),
+        last_stream_error: camera.lastStreamError || null,
         created_by: uid,
         updated_by: uid,
       })
@@ -1381,6 +1412,47 @@ export class AtlasDatabaseService {
       .single();
     if (error) {
       throw new Error(`Camera registration rejected: ${error.message}`);
+    }
+    return this.mapCameraRow(data);
+  }
+
+  /**
+   * Update operational connection state, legal override acceptance, or redacted offline reason.
+   */
+  async updateCameraState(
+    orgId: string,
+    id: string,
+    patch: {
+      connectionState?: CameraRegistryItem['connectionState'];
+      streamStatus?: string;
+      legalBasisRef?: string;
+      adminAcceptedWithoutLegalBasis?: boolean;
+      lastStreamError?: string | null;
+    }
+  ): Promise<CameraRegistryItem> {
+    if (!this.isConfigured()) {
+      throw new Error('Supabase is not configured in .env');
+    }
+    const { data: userData } = await supabase.auth.getUser();
+    const uid = userData?.user?.id;
+    const payload: Record<string, unknown> = { updated_by: uid };
+    if (patch.connectionState !== undefined) payload.connection_state = patch.connectionState;
+    if (patch.streamStatus !== undefined) payload.stream_status = patch.streamStatus;
+    if (patch.legalBasisRef !== undefined) payload.legal_basis_ref = patch.legalBasisRef || null;
+    if (patch.adminAcceptedWithoutLegalBasis !== undefined) {
+      payload.admin_no_legal_basis_accepted = patch.adminAcceptedWithoutLegalBasis;
+    }
+    if (patch.lastStreamError !== undefined) payload.last_stream_error = patch.lastStreamError;
+
+    const { data, error } = await supabase
+      .from('camera_registry')
+      .update(payload)
+      .eq('org_id', orgId)
+      .eq('id', id)
+      .select('*')
+      .single();
+    if (error) {
+      throw new Error(`Camera update rejected: ${error.message}`);
     }
     return this.mapCameraRow(data);
   }

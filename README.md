@@ -78,7 +78,7 @@ Follow this step-by-step walkthrough to test the full lifecycle of Project ATLAS
 
 ### Step 3: Interactive Map Visualization
 1. Click the **Map** tab.
-2. Observe assets rendered on a neutral vector canvas with custom vector layers (no third-party tile servers or external API keys).
+2. Observe assets rendered on a neutral vector canvas with custom vector layers by default (any public raster or vector tiles are requested solely through the authenticated `gateway/` tile proxy, never directly from external APIs).
 3. Criticality and type filters dynamically filter assets.
 4. Notice **approximate points** (such as regional SCADA feeds) are rendered with dashed **accuracy halos** and clearly labeled "approximate".
 5. Click an asset pin to open its profile drawer (site code, criticality, accuracy class, hostnames, and IP addresses).
@@ -172,7 +172,7 @@ Run `supabase/tests/security_suite.sql` in the Supabase SQL Editor. It executes 
 ## 4. What Was Not Done (Out of Scope / Deferred)
 
 To preserve focus on core security, verifiable auditability, and deterministic graph calculations:
-1. **No Default External Tile Servers or Mapbox/Google Maps API Keys**: MapLibre renders using a neutral offline vector canvas by default; operators may explicitly attach frontend-only `https://` WMS/WMTS/XYZ/GeoJSON overlays in the local workspace configuration.
+1. **Gateway-Proxied Basemap Tiles Only**: MapLibre renders using a neutral offline vector canvas by default; public raster or vector tile servers are permitted only through the authenticated `gateway/` tile proxy (`z`/`x`/`y` viewport coordinates only, cached, with zero client IP or user identifier forwarding—pending implementation in a later commit), and operators may explicitly attach workspace-approved `https://` overlays.
 2. **HSM/KMS Key Wrapping for Ingest Secrets**: Per-organisation HMAC-SHA256 ingest key creation, rotation, and revocation are enforced in PostgreSQL (`ingest_keys`); hardware HSM key wrapping is deferred to production infrastructure.
 3. **No Machine Learning Neural Models or External LLM Calls**: All match scoring, workspace query interrogation, and blast radius calculations are strictly deterministic and explainable. No `@google/genai` or external AI SDKs are included.
 4. **No Automated Asset Probing / Port Scanning**: ATLAS does not conduct active scanning; it relies on client-provided, authorised inventory datasets and authenticated signed telemetry senders.

@@ -1,23 +1,50 @@
 /**
- * Project ATLAS — Module D: Threat Intelligence Feed Adapters & Local STIX/KEV Parser
+ * Project ATLAS — Module D: Threat Intelligence Feed Adapters & Proxy Client
  *
  * Security & Integrity Rules:
- * - Zero hardcoded API keys, tokens, or silent background external polling.
- * - Live remote polling to authenticated feeds (MISP, TAXII 2.1, AlienVault OTX) requires
- *   an authorised server-side proxy/edge function (not permitted in locked backend).
- * - Analysts CAN ingest local STIX 2.1 JSON bundles or CISA KEV JSON snapshots directly
+ * - Zero API keys or feed secrets are stored or injected in the browser.
+ * - Authenticated threat-intelligence feeds (MISP, TAXII 2.1, AlienVault OTX, Abuse.ch)
+ *   are queried strictly through the authenticated Linux Execution Gateway CTI proxy
+ *   (`GET /api/v1/cti/indicators`) using the operator's AAL2 Supabase session JWT.
+ * - Analysts can also ingest local STIX 2.1 JSON bundles or CISA KEV JSON snapshots directly
  *   in the browser; all extracted indicators are tagged `isExternalIntel: true` and
  *   strictly separated from verified ATLAS DB tables.
  */
 
+import { supabase } from '../lib/supabase';
+import { validateGatewayEndpointUrl } from './gatewayClient';
 import type {
   Asset,
   CtiAdapterDescriptor,
   CtiProviderId,
+  CtiProxySourceStatus,
   ExternalIocKind,
   ExternalThreatIndicator,
   Incident,
 } from '../types/atlas';
+
+export type ProxyCtiSourceId = 'ALIENVAULT_OTX' | 'ABUSE_CH' | 'MISP' | 'TAXII_2_1';
+
+export interface GatewayNormalizedCtiRecord {
+  type:
+    | 'ip'
+    | 'cidr'
+    | 'domain'
+    | 'hostname'
+    | 'url'
+    | 'hash'
+    | 'certificate'
+    | 'malware'
+    | 'threat_actor'
+    | 'cve';
+  value: string;
+  source: ProxyCtiSourceId;
+  source_ref: string;
+  first_seen: string;
+  last_seen: string | null;
+  confidence: number;
+  tags: string[];
+}
 
 export const CTI_ADAPTER_CATALOG: CtiAdapterDescriptor[] = [
   {
@@ -26,7 +53,7 @@ export const CTI_ADAPTER_CATALOG: CtiAdapterDescriptor[] = [
     protocol: 'OASIS STIX 2.1 JSON',
     status: 'local_bundle_ready',
     requiresServerProxy: false,
-    credentialRequirement: 'None for operator-supplied JSON bundles; TAXII transport requires authorised proxy.',
+    credentialRequirement: 'None for operator-supplied JSON bundles; TAXII transport uses gateway proxy.',
     description:
       'Parses and validates STIX 2.1 indicator, malware, threat-actor, and vulnerability objects locally against ATLAS assets and incidents.',
   },
@@ -36,57 +63,53 @@ export const CTI_ADAPTER_CATALOG: CtiAdapterDescriptor[] = [
     protocol: 'JSON Catalog / Operator Snapshot',
     status: 'local_bundle_ready',
     requiresServerProxy: false,
-    credentialRequirement: 'Direct browser fetch blocked by origin CORS policy without proxy; local KEV JSON snapshot ingestion active.',
+    credentialRequirement: 'Direct browser fetch disabled; local KEV JSON snapshot ingestion active.',
     description:
       'Ingests CISA KEV catalog JSON files (`vulnerabilities[]`) for vulnerability cross-referencing.',
   },
   {
     id: 'MISP',
     name: 'MISP Threat Sharing Instance',
-    protocol: 'MISP REST API (`/attributes/restSearch`)',
-    status: 'deferred_phase_2',
+    protocol: 'Gateway Proxy -> MISP REST (`/attributes/restSearch`)',
+    status: 'unconfigured',
     requiresServerProxy: true,
-    deferredExplanation:
-      'Live MISP polling is deferred to Phase 2 because it requires a server-side proxy to hold credentials.',
-    credentialRequirement: 'Requires `MISP_URL` + `MISP_API_KEY` provisioned inside a server-side Edge proxy.',
+    proxyEndpoint: '/api/v1/cti/indicators',
+    credentialRequirement: 'Configured server-side on gateway via `MISP_URL` + `MISP_API_KEY`.',
     description:
-      'Bidirectional IOC & event attribute sync awaiting an authorised server-side credentialed connector.',
+      'Fetches IOC attributes via the authenticated gateway CTI proxy; credentials remain strictly server-side.',
   },
   {
     id: 'TAXII_2_1',
     name: 'TAXII 2.1 Discovery & Collections',
-    protocol: 'OASIS TAXII 2.1 HTTPS',
-    status: 'deferred_phase_2',
+    protocol: 'Gateway Proxy -> OASIS TAXII 2.1 HTTPS',
+    status: 'unconfigured',
     requiresServerProxy: true,
-    deferredExplanation:
-      'Live TAXII 2.1 collection polling is deferred to Phase 2 per Phase 1 scope and server-proxy requirements.',
-    credentialRequirement: 'Requires collection URL, mTLS/Basic/Bearer credentials in a secure proxy.',
+    proxyEndpoint: '/api/v1/cti/indicators',
+    credentialRequirement: 'Configured server-side on gateway via `TAXII_API_ROOT` + optional `TAXII_COLLECTION_ID`.',
     description:
-      'Automated polling of external TAXII collections awaiting server-side proxy configuration.',
+      'Polls approved TAXII 2.1 STIX object collections through the gateway proxy with 15-minute server caching.',
   },
   {
     id: 'ALIENVAULT_OTX',
     name: 'AlienVault OTX DirectConnect',
-    protocol: 'OTX REST v1 (`/api/v1/pulses/subscribed`)',
-    status: 'deferred_phase_2',
+    protocol: 'Gateway Proxy -> OTX REST v1 (`/api/v1/pulses/subscribed`)',
+    status: 'unconfigured',
     requiresServerProxy: true,
-    deferredExplanation:
-      'Live OTX pulse polling is deferred to Phase 2 because `X-OTX-API-KEY` must be injected by a server proxy.',
-    credentialRequirement: 'Requires `X-OTX-API-KEY` header injected server-side.',
+    proxyEndpoint: '/api/v1/cti/indicators',
+    credentialRequirement: 'Configured server-side on gateway via `OTX_API_KEY`.',
     description:
-      'Subscribed OTX pulse ingestion disabled until API key proxy is provisioned.',
+      'Ingests subscribed OTX pulse indicators through the gateway proxy where `X-OTX-API-KEY` is injected.',
   },
   {
     id: 'ABUSE_CH',
     name: 'Abuse.ch Feeds (ThreatFox / URLhaus / Feodo)',
-    protocol: 'HTTPS JSON API',
-    status: 'deferred_phase_2',
+    protocol: 'Gateway Proxy -> HTTPS JSON API',
+    status: 'unconfigured',
     requiresServerProxy: true,
-    deferredExplanation:
-      'Live Abuse.ch feed polling is deferred to Phase 2 because it requires an authenticated server-side CORS relay.',
-    credentialRequirement: 'Requires `Auth-Key` header & server-side CORS relay.',
+    proxyEndpoint: '/api/v1/cti/indicators',
+    credentialRequirement: 'Configured server-side on gateway via `ABUSECH_AUTH_KEY`.',
     description:
-      'C2 IP/domain/malware hash feed adapter awaiting authorised server relay.',
+      'Aggregates ThreatFox, URLhaus, and Feodo Tracker IOC feeds via the gateway proxy with server-side `Auth-Key`.',
   },
 ];
 
@@ -152,6 +175,173 @@ function correlateAgainstAtlas(
   }
 
   return { matchedAssetIds, matchedIncidentIds };
+}
+
+function mapNormalizedTypeToIocKind(rawType: GatewayNormalizedCtiRecord['type']): ExternalIocKind {
+  if (rawType === 'url') return 'hostname';
+  return rawType;
+}
+
+function extractCorrelationNeedle(rawType: GatewayNormalizedCtiRecord['type'], value: string): string {
+  if (rawType === 'url') {
+    try {
+      return new URL(value).hostname.toLowerCase() || value.toLowerCase();
+    } catch {
+      return value.toLowerCase();
+    }
+  }
+  return value.toLowerCase();
+}
+
+export function mapProxyIndicatorsToExternal(
+  records: GatewayNormalizedCtiRecord[],
+  orgId: string,
+  assets: Asset[],
+  incidents: Incident[],
+  existingIndicators: ExternalThreatIndicator[] = [],
+  nowMs = Date.now()
+): { indicators: ExternalThreatIndicator[]; skippedDuplicates: number } {
+  const seenKeys = new Set(existingIndicators.map((i) => `${i.indicatorType}::${i.value.toLowerCase()}`));
+  const out: ExternalThreatIndicator[] = [];
+  let skippedDuplicates = 0;
+
+  for (const rec of records) {
+    const cleanVal = String(rec.value || '').trim();
+    if (!cleanVal) continue;
+    const indicatorType = mapNormalizedTypeToIocKind(rec.type);
+    const key = `${indicatorType}::${cleanVal.toLowerCase()}`;
+    if (seenKeys.has(key)) {
+      skippedDuplicates++;
+      continue;
+    }
+    seenKeys.add(key);
+
+    const needle = extractCorrelationNeedle(rec.type, cleanVal);
+    const { matchedAssetIds, matchedIncidentIds } = correlateAgainstAtlas(needle, assets, incidents);
+    const tagsLabel = Array.isArray(rec.tags) && rec.tags.length > 0 ? `Tags: ${rec.tags.join(', ')}` : 'Gateway CTI Proxy';
+
+    out.push({
+      id: `ext-proxy-${rec.source.toLowerCase()}-${nowMs}-${out.length}`,
+      orgId,
+      providerId: rec.source,
+      stixId: rec.source_ref,
+      indicatorType,
+      value: cleanVal,
+      sourceName: `${rec.source} (${rec.source_ref})`,
+      confidence: Math.max(0, Math.min(100, Math.round(rec.confidence ?? 65))),
+      validFrom: rec.first_seen || new Date(nowMs).toISOString(),
+      validUntil: rec.last_seen || undefined,
+      isExpired: false,
+      isExternalIntel: true,
+      verificationStatus: 'unverified',
+      matchedAssetIds,
+      matchedIncidentIds,
+      rawSummary: `${rec.source_ref} · ${tagsLabel}`,
+      importedAt: new Date(nowMs).toISOString(),
+    });
+  }
+
+  return { indicators: out, skippedDuplicates };
+}
+
+async function getSupabaseJwt(): Promise<string> {
+  const { data } = await supabase.auth.getSession();
+  const token = data?.session?.access_token;
+  if (!token) {
+    throw new Error('No active authenticated Supabase AAL2 session found.');
+  }
+  return token;
+}
+
+export async function probeCtiProxySources(
+  endpointUrl: string,
+  orgId: string
+): Promise<CtiProxySourceStatus[]> {
+  const check = validateGatewayEndpointUrl(endpointUrl);
+  if (!check.valid || !check.normalized) {
+    throw new Error(check.reason || 'Invalid gateway URL.');
+  }
+  const jwt = await getSupabaseJwt();
+  const res = await fetch(`${check.normalized}/health`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      'x-atlas-org-id': orgId,
+      Accept: 'application/json',
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error || `Gateway probe failed (HTTP ${res.status}).`);
+  }
+  const list = Array.isArray(data?.ctiSources) ? data.ctiSources : [];
+  return list.map((s: any) => ({
+    id: s.id as ProxyCtiSourceId,
+    configured: Boolean(s.configured),
+    state: s.configured ? 'configured' : 'unconfigured',
+    cached: false,
+    indicatorCount: 0,
+    checkedAtUtc: data.checkedAtUtc,
+  }));
+}
+
+export async function fetchCtiProxyIndicators(params: {
+  endpointUrl: string;
+  orgId: string;
+  source?: ProxyCtiSourceId;
+  type?: ExternalIocKind;
+  limit?: number;
+  assets: Asset[];
+  incidents: Incident[];
+  existingIndicators?: ExternalThreatIndicator[];
+}): Promise<{
+  indicators: ExternalThreatIndicator[];
+  skippedDuplicates: number;
+  sources: CtiProxySourceStatus[];
+  failedSources: Array<{ source: ProxyCtiSourceId; reason: string }>;
+  cacheTtlSeconds: number;
+}> {
+  const check = validateGatewayEndpointUrl(params.endpointUrl);
+  if (!check.valid || !check.normalized) {
+    throw new Error(check.reason || 'Invalid gateway URL.');
+  }
+
+  const jwt = await getSupabaseJwt();
+  const qs = new URLSearchParams();
+  if (params.source) qs.set('source', params.source);
+  if (params.type) qs.set('type', params.type);
+  if (params.limit) qs.set('limit', String(params.limit));
+  const queryStr = qs.toString() ? `?${qs.toString()}` : '';
+
+  const res = await fetch(`${check.normalized}/api/v1/cti/indicators${queryStr}`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${jwt}`,
+      'x-atlas-org-id': params.orgId,
+      Accept: 'application/json',
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.error || `CTI proxy request failed (HTTP ${res.status}).`);
+  }
+
+  const rawRecords = Array.isArray(data?.indicators) ? (data.indicators as GatewayNormalizedCtiRecord[]) : [];
+  const mapped = mapProxyIndicatorsToExternal(
+    rawRecords,
+    params.orgId,
+    params.assets,
+    params.incidents,
+    params.existingIndicators || []
+  );
+
+  return {
+    indicators: mapped.indicators,
+    skippedDuplicates: mapped.skippedDuplicates,
+    sources: Array.isArray(data?.sources) ? (data.sources as CtiProxySourceStatus[]) : [],
+    failedSources: Array.isArray(data?.failedSources) ? data.failedSources : [],
+    cacheTtlSeconds: Number(data?.cacheTtlSeconds || 900),
+  };
 }
 
 export interface CtiParseReport {

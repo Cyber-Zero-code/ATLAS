@@ -581,6 +581,69 @@ export interface AttributionRecord {
 // Module C: Geospatial, Elevation & Camera Gateway Types
 // ============================================================================
 
+export type CameraRetentionSetting = 'none' | '1h' | '24h' | '7d' | '30d';
+
+export interface CameraFaceObservation {
+  confidence: number;
+  box: { x: number; y: number; w: number; h: number };
+  recognizedIdentityId?: string;
+  recognizedLabel?: string;
+  biometricSimilarity?: number;
+}
+
+export interface CameraPersonObservation {
+  trackId: string;
+  confidence: number;
+  box: { x: number; y: number; w: number; h: number };
+  identityId?: string;
+  personLabel?: string;
+  crossCameraSeenIn?: string[];
+}
+
+export interface CameraPersonAlert {
+  alertId: string;
+  cameraId: string;
+  cameraCode: string;
+  personLabel: string;
+  identityId?: string;
+  trackId?: string;
+  confidence: number;
+  reason: string;
+  triggeredAtUtc: string;
+}
+
+export interface CameraAnalyticsSnapshot {
+  status: 'ANALYZED' | 'ANALYTICS_UNAVAILABLE';
+  unavailableReason?: string;
+  analyzedAtUtc: string;
+  faceCount: number;
+  personCount: number;
+  faces: CameraFaceObservation[];
+  persons: CameraPersonObservation[];
+  alerts: CameraPersonAlert[];
+}
+
+export interface GatewayCameraRecord {
+  cameraId: string;
+  orgId: string;
+  siteId?: string;
+  siteCode?: string;
+  cameraCode: string;
+  name: string;
+  protocol: 'ONVIF' | 'RTSP_WEBRTC' | 'RTSP_HLS';
+  retentionSetting: CameraRetentionSetting;
+  legalBasisRef?: string;
+  adminAcceptedWithoutLegalBasis: boolean;
+  adminAcceptedBy?: string;
+  status: 'registered' | 'streaming' | 'offline' | 'stopped';
+  consecutiveFailures: number;
+  offlineReason?: string;
+  lastFrameAtUtc?: string;
+  hasLatestFrame: boolean;
+  storedFramesCount: number;
+  latestAnalytics?: CameraAnalyticsSnapshot;
+}
+
 export interface CameraRegistryItem {
   id: string;
   cameraCode: string;
@@ -591,9 +654,15 @@ export interface CameraRegistryItem {
   bearingDeg: number;
   fovDeg: number;
   rangeMeters: number;
-  connectionState?: 'registered' | 'configured' | 'connected' | 'operational';
+  siteId?: string;
+  siteCode?: string;
+  retentionSetting?: CameraRetentionSetting;
+  legalBasisRef?: string;
+  adminAcceptedWithoutLegalBasis?: boolean;
+  connectionState?: 'registered' | 'configured' | 'connected' | 'operational' | 'offline';
   streamStatus: string;
   endpointUrl?: string;
+  lastStreamError?: string;
 }
 
 export interface GisAdapterCatalogEntry {
@@ -623,11 +692,21 @@ export interface CtiAdapterDescriptor {
   id: CtiProviderId;
   name: string;
   protocol: string;
-  status: 'local_bundle_ready' | 'deferred_phase_2';
+  status: 'local_bundle_ready' | 'unconfigured' | 'configured' | 'live' | 'failing';
   requiresServerProxy: boolean;
-  deferredExplanation?: string;
+  proxyEndpoint?: string;
   credentialRequirement: string;
   description: string;
+}
+
+export interface CtiProxySourceStatus {
+  id: 'ALIENVAULT_OTX' | 'ABUSE_CH' | 'MISP' | 'TAXII_2_1';
+  configured: boolean;
+  state: 'unconfigured' | 'configured' | 'live' | 'failing';
+  cached: boolean;
+  indicatorCount: number;
+  error?: string;
+  checkedAtUtc?: string;
 }
 
 export type ExternalIocKind =
